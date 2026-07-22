@@ -1,0 +1,32 @@
+{
+  // TypeScript is used as a design constraint: components consume explicit
+  // frontend domain models and produce no emitted JavaScript of their own.
+  "compilerOptions": {
+    // Modern browser output keeps generated code small and matches Vite's
+    // evergreen-browser development target.
+    "target": "ES2022",
+    "useDefineForClassFields": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    // Dependency declarations are trusted so type checking stays focused on
+    // application code rather than third-party package internals.
+    "skipLibCheck": true,
+    // Bundler resolution matches the way Vite resolves ESM and package exports.
+    "moduleResolution": "Bundler",
+    "allowImportingTsExtensions": true,
+    // Fixtures may move to JSON without forcing components to change imports.
+    "resolveJsonModule": true,
+    // Each source file must be safe for Vite/esbuild to transform independently.
+    "isolatedModules": true,
+    // Vite performs emission; this invocation exists only to validate types.
+    "noEmit": true,
+    "jsx": "react-jsx",
+    // Strictness and indexed-access checks keep mock data and future API data
+    // from introducing silent undefined values into the interface.
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "types": ["vite/client"]
+  },
+  // Backend Python modules and generated output are intentionally out of scope.
+  "include": ["src"]
+}

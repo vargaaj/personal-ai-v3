@@ -1,0 +1,1073 @@
+/*
+ * Cadence visual system for the personal Review console.
+ *
+ * Sections follow the rendered experience: shared foundations, desktop shell,
+ * navigation, review controls, cadence groups, entries, responsive adaptations,
+ * and reduced motion. Flat component classes keep specificity predictable as
+ * React components are split into smaller files later.
+ */
+
+/* -------------------------------------------------------------------------- */
+/* Design tokens and document defaults                                        */
+/* -------------------------------------------------------------------------- */
+
+:root {
+    color: #18221f;
+    background: #f3f6f2;
+    font-family: "Public Sans Variable", "Public Sans", system-ui, sans-serif;
+    font-synthesis: none;
+    text-rendering: optimizeLegibility;
+    --graphite: #18221f;
+    --milkglass: #f3f6f2;
+    --porcelain: #fcfdfc;
+    --juniper: #2f6b5f;
+    --iris: #5b63a6;
+    --saffron: #d7a63e;
+    --line: #d9e2dc;
+    --muted: #69736e;
+  }
+
+  /* Predictable sizing prevents padding and borders from widening
+     responsive controls beyond their declared grid columns. */
+  * {
+    box-sizing: border-box;
+  }
+
+  html {
+    background: var(--milkglass);
+  }
+
+  /* The body owns the calm working canvas. The faint grid suggests an
+     instrument surface without becoming semantic or decorative content. */
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background:
+      linear-gradient(90deg, rgba(47, 107, 95, 0.025) 1px, transparent 1px) 0 0 / 72px 72px,
+      var(--milkglass);
+    color: var(--graphite);
+  }
+
+  button,
+  input {
+    font: inherit;
+  }
+
+  button,
+  a {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  button {
+    color: inherit;
+  }
+
+  /* Two-layer focus treatment stays visible against Milkglass and white
+     surfaces. focus-visible avoids rings on ordinary pointer clicks. */
+  button:focus-visible,
+  a:focus-visible,
+  input:focus-visible {
+    outline: 2px solid var(--porcelain);
+    box-shadow: 0 0 0 4px var(--iris);
+  }
+
+  /* Visually hidden copy remains available to assistive technology for
+     control labels and concise completion announcements. */
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  /* ------------------------------------------------------------------------ */
+  /* Application shell and persistent desktop navigation                     */
+  /* ------------------------------------------------------------------------ */
+
+  .app-frame {
+    min-height: 100vh;
+    display: grid;
+    grid-template-columns: 252px minmax(0, 1fr);
+  }
+
+  .sidebar {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    padding: 28px 18px 22px;
+    border-right: 1px solid rgba(24, 34, 31, 0.1);
+    background: rgba(252, 253, 252, 0.88);
+    backdrop-filter: blur(20px);
+  }
+
+  /* The brand repeats the cadence motif so the signature rail reads as
+     product structure rather than decoration added only to the queue. */
+  .brand-row {
+    display: flex;
+    align-items: center;
+    gap: 11px;
+    padding: 0 8px 24px;
+  }
+
+  .cadence-mark {
+    position: relative;
+    width: 34px;
+    height: 38px;
+    flex: 0 0 34px;
+    border-radius: 11px;
+    background: var(--graphite);
+    overflow: hidden;
+  }
+
+  .cadence-mark::before {
+    content: "";
+    position: absolute;
+    top: 7px;
+    bottom: 7px;
+    left: 16px;
+    width: 1px;
+    background: rgba(252, 253, 252, 0.42);
+  }
+
+  .cadence-mark span {
+    position: absolute;
+    left: 13px;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    border: 2px solid var(--graphite);
+    background: var(--porcelain);
+  }
+
+  .cadence-mark span:nth-child(1) { top: 5px; }
+  .cadence-mark span:nth-child(2) { top: 15px; background: var(--saffron); }
+  .cadence-mark span:nth-child(3) { top: 25px; }
+
+  .brand-copy {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    line-height: 1.1;
+  }
+
+  /* Utility typography is grouped here so dates, labels, and changing counts
+     share a stable monospaced rhythm. */
+  .brand-copy span,
+  .nav-label,
+  .eyebrow,
+  .entry-metadata,
+  .area-count,
+  .mobile-open-count {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+  }
+
+  .brand-copy span {
+    margin-bottom: 4px;
+    color: var(--muted);
+    font-size: 0.61rem;
+    letter-spacing: 0.11em;
+    text-transform: uppercase;
+  }
+
+  .brand-copy strong {
+    font-family: "Literata Variable", Georgia, serif;
+    font-size: 1.05rem;
+    font-weight: 560;
+    letter-spacing: -0.025em;
+  }
+
+  /* ------------------------------------------------------------------------ */
+  /* Sidebar navigation                                                       */
+  /* ------------------------------------------------------------------------ */
+
+  .nav-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+
+  .nav-label {
+    margin: 11px 10px 7px;
+    color: #7d8782;
+    font-size: 0.61rem;
+    font-weight: 500;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+  }
+
+  .nav-label.area-label {
+    margin-top: 23px;
+  }
+
+  /* Three columns reserve stable space for icon, label, and open count. */
+  .nav-item {
+    position: relative;
+    width: 100%;
+    min-height: 44px;
+    display: grid;
+    grid-template-columns: 28px minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 7px;
+    padding: 6px 10px 6px 8px;
+    border: 0;
+    border-radius: 9px;
+    background: transparent;
+    cursor: pointer;
+    text-align: left;
+    font-size: 0.88rem;
+    font-weight: 500;
+    transition: background 160ms ease, color 160ms ease;
+  }
+
+  .nav-item:hover {
+    background: #edf2ee;
+  }
+
+  .nav-item.is-active {
+    background: #e5ece7;
+    color: #204f46;
+  }
+
+  /* The edge marker supplements the background change, so selection is not
+     communicated by a subtle color shift alone. */
+  .nav-item.is-active::before {
+    content: "";
+    position: absolute;
+    left: -18px;
+    top: 11px;
+    bottom: 11px;
+    width: 3px;
+    border-radius: 0 4px 4px 0;
+    background: var(--juniper);
+  }
+
+  .nav-icon {
+    width: 28px;
+    height: 28px;
+    display: grid;
+    place-items: center;
+    border-radius: 8px;
+    color: #66706b;
+  }
+
+  .nav-icon.accent-juniper { color: var(--juniper); }
+  .nav-icon.accent-iris { color: var(--iris); }
+  .nav-icon.accent-saffron { color: #98701b; }
+
+  .nav-count {
+    min-width: 21px;
+    padding: 2px 6px;
+    border: 1px solid rgba(24, 34, 31, 0.09);
+    border-radius: 999px;
+    background: rgba(252, 253, 252, 0.7);
+    color: #66706b;
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 0.65rem;
+    text-align: center;
+  }
+
+  /* The footer remains informational until a real persistence/sync layer can
+     provide an accurate interactive status surface. */
+  .sidebar-foot {
+    margin-top: auto;
+    padding: 18px 8px 0;
+    border-top: 1px solid var(--line);
+  }
+
+  .sidebar-foot p {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    margin: 0;
+    color: #88918d;
+    font-size: 0.67rem;
+    line-height: 1.4;
+  }
+
+  .sync-dot {
+    width: 6px;
+    height: 6px;
+    flex: 0 0 6px;
+    border-radius: 50%;
+    background: var(--juniper);
+    box-shadow: 0 0 0 3px rgba(47, 107, 95, 0.12);
+  }
+
+  /* Mobile-only elements are removed from desktop layout and accessibility.
+     Breakpoint rules below selectively restore them. */
+  .close-nav,
+  .mobile-header,
+  .nav-scrim {
+    display: none;
+  }
+
+  /* ------------------------------------------------------------------------ */
+  /* Main review workspace                                                    */
+  /* ------------------------------------------------------------------------ */
+
+  .main-content {
+    min-width: 0;
+    padding: 52px clamp(30px, 5.5vw, 84px) 88px;
+  }
+
+  /* The maximum width protects readable line lengths on large displays. */
+  .main-inner {
+    width: min(100%, 1040px);
+    margin: 0 auto;
+  }
+
+  .page-header {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 42px;
+  }
+
+  .eyebrow {
+    margin: 0 0 14px;
+    color: var(--juniper);
+    font-size: 0.68rem;
+    font-weight: 500;
+    letter-spacing: 0.105em;
+    text-transform: uppercase;
+  }
+
+  /* Literata is concentrated in headings; working prose remains in the more
+     neutral and highly readable Public Sans. */
+  .page-header h1 {
+    max-width: 760px;
+    margin: 0;
+    font-family: "Literata Variable", Georgia, serif;
+    font-size: clamp(2.55rem, 5vw, 4.45rem);
+    font-weight: 470;
+    letter-spacing: -0.055em;
+    line-height: 0.98;
+  }
+
+  .page-summary {
+    max-width: 610px;
+    margin: 19px 0 0;
+    color: var(--muted);
+    font-size: 0.98rem;
+    line-height: 1.58;
+  }
+
+  /* Supporting session context, intentionally not a dashboard metric card. */
+  .cleared-note {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 9px 2px;
+    color: var(--juniper);
+  }
+
+  .cleared-note span {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .cleared-note strong {
+    font-size: 0.78rem;
+    font-weight: 650;
+  }
+
+  .cleared-note small {
+    margin-top: 1px;
+    color: #7f8984;
+    font-size: 0.68rem;
+  }
+
+  /* ------------------------------------------------------------------------ */
+  /* Sticky queue filters and search                                          */
+  /* ------------------------------------------------------------------------ */
+
+  .queue-tools {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    margin-top: 34px;
+    padding: 14px 0;
+    border-top: 1px solid rgba(24, 34, 31, 0.12);
+    border-bottom: 1px solid rgba(24, 34, 31, 0.12);
+    background: rgba(243, 246, 242, 0.92);
+    backdrop-filter: blur(16px);
+  }
+
+  /* The segmented surface allows one Open, All, or Done view at a time. */
+  .filter-group {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    padding: 3px;
+    border-radius: 10px;
+    background: #e7ece8;
+  }
+
+  .filter-group button {
+    min-width: 44px;
+    min-height: 44px;
+    padding: 0 11px;
+    border: 0;
+    border-radius: 7px;
+    background: transparent;
+    cursor: pointer;
+    color: #69736e;
+    font-size: 0.74rem;
+    font-weight: 550;
+    white-space: nowrap;
+  }
+
+  .filter-group button:hover {
+    color: var(--graphite);
+  }
+
+  /* Surface, contrast, and aria-pressed semantics reinforce selection without
+     relying on color alone. */
+  .filter-group button.is-selected {
+    background: var(--porcelain);
+    color: var(--graphite);
+    box-shadow: 0 1px 3px rgba(24, 34, 31, 0.11);
+  }
+
+  .search-field {
+    width: min(230px, 100%);
+    min-height: 44px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-left: auto;
+    padding: 0 10px;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    color: #7b8580;
+    transition: background 150ms ease, border-color 150ms ease;
+  }
+
+  /* The compound field highlights as a unit while its borderless input owns
+     actual keyboard focus. */
+  .search-field:focus-within {
+    border-color: #cbd5cf;
+    background: var(--porcelain);
+  }
+
+  /* Keyboard focus receives the same high-contrast two-layer treatment as
+     standalone controls, but it surrounds the complete search surface instead
+     of only the small text-editing region. */
+  .search-field:has(input:focus-visible) {
+    outline: 2px solid var(--porcelain);
+    box-shadow: 0 0 0 4px var(--iris);
+  }
+
+  .search-field input {
+    width: 100%;
+    min-width: 0;
+    border: 0;
+    outline: 0;
+    background: transparent;
+    color: var(--graphite);
+    font-size: 0.78rem;
+  }
+
+  .search-field input::placeholder {
+    color: #8a938f;
+  }
+
+  .search-field input:focus-visible {
+    outline: 0;
+    box-shadow: none;
+  }
+
+  /* ------------------------------------------------------------------------ */
+  /* Cadence rail and area grouping                                           */
+  /* ------------------------------------------------------------------------ */
+
+  .queue {
+    margin-top: 34px;
+  }
+
+  /* Left padding reserves a structural column for the rail rather than
+     overlaying it on variable-length text. */
+  .area-section {
+    --area-accent: var(--juniper);
+    position: relative;
+    padding: 0 0 49px 54px;
+  }
+
+  .area-section.accent-iris { --area-accent: var(--iris); }
+  .area-section.accent-saffron { --area-accent: #b17e18; }
+
+  /* Every section draws one rail segment. The gradient softens transitions
+     between area accents while preserving a continuous path. */
+  .area-section::before {
+    content: "";
+    position: absolute;
+    top: 17px;
+    bottom: -3px;
+    left: 15px;
+    width: 1px;
+    background: linear-gradient(var(--area-accent), #cbd6cf 18%, #cbd6cf 86%, transparent);
+    opacity: 0.68;
+  }
+
+  .area-section:last-child::before {
+    bottom: 17px;
+  }
+
+  /* The rail node is functional area navigation. Its hint appears for pointer
+     hover and keyboard focus with the same action. */
+  .rail-stop {
+    position: absolute;
+    top: -5px;
+    left: -6px;
+    z-index: 2;
+    width: 44px;
+    height: 44px;
+    display: grid;
+    place-items: center;
+    padding: 0;
+    border: 0;
+    border-radius: 999px;
+    background: var(--milkglass);
+    cursor: pointer;
+  }
+
+  .rail-core {
+    width: 13px;
+    height: 13px;
+    border: 3px solid var(--milkglass);
+    border-radius: 999px;
+    background: var(--area-accent);
+    box-shadow: 0 0 0 1px var(--area-accent);
+    transition: height 180ms ease, border-radius 180ms ease;
+  }
+
+  /* Hidden until interaction so the rail stays quiet during ordinary scanning. */
+  .rail-hint {
+    position: absolute;
+    left: 38px;
+    z-index: 3;
+    padding: 4px 7px;
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    background: var(--porcelain);
+    box-shadow: 0 5px 16px rgba(24, 34, 31, 0.08);
+    color: var(--graphite);
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 0.58rem;
+    letter-spacing: 0.03em;
+    opacity: 0;
+    pointer-events: none;
+    transform: translateX(-4px);
+    transition: opacity 140ms ease, transform 140ms ease;
+  }
+
+  .rail-stop:hover .rail-core,
+  .rail-stop:focus-visible .rail-core {
+    height: 21px;
+  }
+
+  .rail-stop:hover .rail-hint,
+  .rail-stop:focus-visible .rail-hint {
+    opacity: 1;
+    transform: translateX(0);
+  }
+
+  .area-heading {
+    display: grid;
+    grid-template-columns: 36px minmax(0, 1fr);
+    align-items: start;
+    gap: 12px;
+    margin-bottom: 13px;
+  }
+
+  /* color-mix derives quiet tints from the small, named accent palette instead
+     of introducing unrelated hard-coded badge colors. */
+  .area-icon {
+    width: 36px;
+    height: 36px;
+    display: grid;
+    place-items: center;
+    border: 1px solid color-mix(in srgb, var(--area-accent) 24%, transparent);
+    border-radius: 10px;
+    background: color-mix(in srgb, var(--area-accent) 8%, var(--porcelain));
+    color: var(--area-accent);
+  }
+
+  .area-title-line {
+    min-height: 26px;
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+  }
+
+  .area-heading h2 {
+    margin: 0;
+    font-family: "Literata Variable", Georgia, serif;
+    font-size: 1.21rem;
+    font-weight: 570;
+    letter-spacing: -0.025em;
+  }
+
+  .area-count {
+    color: var(--area-accent);
+    font-size: 0.62rem;
+    letter-spacing: 0.03em;
+  }
+
+  .area-heading p {
+    max-width: 680px;
+    margin: 3px 0 0;
+    color: var(--muted);
+    font-size: 0.78rem;
+    line-height: 1.45;
+  }
+
+  /* ------------------------------------------------------------------------ */
+  /* Review entry surface and state controls                                  */
+  /* ------------------------------------------------------------------------ */
+
+  /* One area is one surface; entries use dividers instead of disconnected
+     dashboard cards. */
+  .entry-list {
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-radius: 13px;
+    background: rgba(252, 253, 252, 0.95);
+    box-shadow: 0 14px 38px rgba(30, 47, 42, 0.045);
+  }
+
+  /* Fixed action columns and flexible prose keep long text from displacing
+     completion and external-link controls. */
+  .entry-row {
+    min-width: 0;
+    display: grid;
+    grid-template-columns: 45px minmax(0, 1fr) 44px;
+    align-items: start;
+    padding: 17px 12px 17px 9px;
+    border-bottom: 1px solid #e5ebe6;
+    transition: background 150ms ease;
+  }
+
+  .entry-row:last-child {
+    border-bottom: 0;
+  }
+
+  .entry-row:hover {
+    background: #f8faf8;
+  }
+
+  .entry-row.is-done {
+    background: #f7f9f7;
+  }
+
+  /* The 44px button supplies the touch target while the smaller square keeps
+     the reading surface visually compact. */
+  .check-control {
+    width: 44px;
+    height: 44px;
+    display: grid;
+    place-items: center;
+    margin-top: -10px;
+    padding: 0;
+    border: 0;
+    border-radius: 9px;
+    background: transparent;
+    cursor: pointer;
+  }
+
+  .check-dot {
+    width: 19px;
+    height: 19px;
+    display: grid;
+    place-items: center;
+    border: 1.5px solid #94a19a;
+    border-radius: 6px;
+    background: var(--porcelain);
+    color: white;
+    transition: transform 150ms ease, background 150ms ease, border-color 150ms ease;
+  }
+
+  .check-control:hover .check-dot {
+    border-color: var(--juniper);
+    transform: scale(1.07);
+  }
+
+  .check-control[aria-pressed="true"] .check-dot {
+    border-color: var(--juniper);
+    background: var(--juniper);
+  }
+
+  .entry-copy {
+    min-width: 0;
+  }
+
+  /* Imported titles may contain long identifiers, so wrapping is preferred to
+     truncation or ellipsis. */
+  .entry-copy h3 {
+    max-width: 72ch;
+    margin: 0;
+    overflow-wrap: anywhere;
+    font-size: 0.94rem;
+    font-weight: 620;
+    letter-spacing: -0.012em;
+    line-height: 1.4;
+  }
+
+  .entry-row.is-done .entry-copy h3 {
+    color: #76807b;
+    text-decoration: line-through;
+    text-decoration-color: #aeb8b2;
+  }
+
+  /* Preserve deliberate line breaks from notes and workout instructions. */
+  .entry-copy > p {
+    max-width: 74ch;
+    margin: 7px 0 0;
+    color: #66716b;
+    font-size: 0.82rem;
+    line-height: 1.56;
+    overflow-wrap: anywhere;
+    white-space: pre-line;
+  }
+
+  /* Metadata wraps independently so utility text cannot widen the prose column. */
+  .entry-metadata {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 12px;
+    margin-top: 11px;
+    color: #7b8580;
+    font-size: 0.61rem;
+    line-height: 1.4;
+  }
+
+  .entry-metadata span {
+    overflow-wrap: anywhere;
+  }
+
+  .entry-metadata b {
+    color: #53605a;
+    font-weight: 500;
+    text-transform: uppercase;
+  }
+
+  .entry-metadata .needs-attention {
+    position: relative;
+    color: #7d5b15;
+  }
+
+  /* The dot reinforces the adjacent visible label/value and is never the sole
+     carrier of urgency or due-date meaning. */
+  .entry-metadata .needs-attention::before {
+    content: "";
+    display: inline-block;
+    width: 5px;
+    height: 5px;
+    margin: 0 6px 1px 0;
+    border-radius: 50%;
+    background: var(--saffron);
+  }
+
+  .entry-link,
+  .entry-link-spacer {
+    width: 44px;
+    height: 44px;
+  }
+
+  /* Square link targets stay aligned with the invisible spacer used by rows that
+     do not have an external destination. */
+  .entry-link {
+    display: grid;
+    place-items: center;
+    border-radius: 9px;
+    color: #718079;
+    transition: background 150ms ease, color 150ms ease;
+  }
+
+  .entry-link:hover {
+    background: #edf2ee;
+    color: var(--iris);
+  }
+
+  /* Empty results explain the current view and provide a concrete reset action
+     instead of decorative celebration. */
+  .empty-state {
+    display: grid;
+    justify-items: center;
+    padding: 70px 22px;
+    border: 1px dashed #cbd6cf;
+    border-radius: 14px;
+    text-align: center;
+  }
+
+  .empty-check {
+    width: 44px;
+    height: 44px;
+    display: grid;
+    place-items: center;
+    border-radius: 50%;
+    background: #e0ece7;
+    color: var(--juniper);
+  }
+
+  .empty-state h2 {
+    margin: 16px 0 5px;
+    font-family: "Literata Variable", Georgia, serif;
+    font-size: 1.25rem;
+  }
+
+  .empty-state p {
+    max-width: 440px;
+    margin: 0;
+    color: var(--muted);
+    font-size: 0.84rem;
+    line-height: 1.5;
+  }
+
+  .empty-state button {
+    min-height: 44px;
+    margin-top: 18px;
+    padding: 0 14px;
+    border: 1px solid var(--juniper);
+    border-radius: 8px;
+    background: var(--juniper);
+    color: white;
+    cursor: pointer;
+    font-size: 0.76rem;
+    font-weight: 600;
+  }
+
+  /* Shared dimensions meet the mobile touch-target floor for icon-only controls. */
+  .icon-button {
+    width: 44px;
+    height: 44px;
+    display: grid;
+    place-items: center;
+    padding: 0;
+    border: 0;
+    border-radius: 10px;
+    background: transparent;
+    cursor: pointer;
+  }
+
+  /* The close action exists in markup but appears only when navigation becomes
+     an off-canvas drawer. */
+  .icon-button.close-nav {
+    display: none;
+  }
+
+  /* ------------------------------------------------------------------------ */
+  /* Tablet/mobile: persistent sidebar becomes an accessible off-canvas drawer */
+  /* ------------------------------------------------------------------------ */
+
+  @media (max-width: 900px) {
+    .app-frame {
+      display: block;
+    }
+
+    .sidebar {
+      position: fixed;
+      inset: 0 auto 0 0;
+      width: min(86vw, 280px);
+      height: 100dvh;
+      /* Visibility and pointer-events remove the closed drawer from both
+         assistive navigation and accidental pointer interaction. */
+      visibility: hidden;
+      pointer-events: none;
+      transform: translateX(-104%);
+      transition:
+        transform 210ms cubic-bezier(0.22, 1, 0.36, 1),
+        visibility 0s linear 210ms;
+      box-shadow: 20px 0 50px rgba(24, 34, 31, 0.13);
+    }
+
+    .sidebar.is-open {
+      visibility: visible;
+      pointer-events: auto;
+      transform: translateX(0);
+      transition-delay: 0s;
+    }
+
+    .nav-scrim {
+      position: fixed;
+      inset: 0;
+      z-index: 15;
+      display: block;
+      background: rgba(24, 34, 31, 0.28);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 180ms ease;
+    }
+
+    .nav-scrim.is-visible {
+      opacity: 1;
+      pointer-events: auto;
+    }
+
+    .icon-button.close-nav {
+      display: grid;
+      margin-left: auto;
+    }
+
+    /* Fixed header preserves navigation above a long queue; main-content padding
+       reserves the same vertical space below it. */
+    .mobile-header {
+      position: fixed;
+      inset: 0 0 auto 0;
+      z-index: 12;
+      min-height: 62px;
+      display: grid;
+      grid-template-columns: 44px minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 17px;
+      border-bottom: 1px solid rgba(24, 34, 31, 0.1);
+      background: rgba(252, 253, 252, 0.9);
+      backdrop-filter: blur(18px);
+      font-family: "Literata Variable", Georgia, serif;
+      font-size: 0.92rem;
+      font-weight: 560;
+    }
+
+    .mobile-open-count {
+      color: var(--juniper);
+      font-size: 0.62rem;
+      font-weight: 500;
+    }
+
+    .main-content {
+      padding: 105px 24px 72px;
+    }
+
+    .queue-tools {
+      top: 62px;
+    }
+  }
+
+  /* ------------------------------------------------------------------------ */
+  /* Narrow phones: stack controls and return more width to entry prose        */
+  /* ------------------------------------------------------------------------ */
+
+  @media (max-width: 640px) {
+    .main-content {
+      padding-right: 16px;
+      padding-left: 16px;
+    }
+
+    .page-header {
+      display: block;
+    }
+
+    .page-header h1 {
+      max-width: 520px;
+      font-size: clamp(2.35rem, 12vw, 3.45rem);
+    }
+
+    .cleared-note {
+      margin-top: 15px;
+    }
+
+    .queue-tools {
+      align-items: stretch;
+      flex-direction: column;
+      gap: 10px;
+      margin-top: 26px;
+      padding: 12px 0;
+    }
+
+    /* Horizontal overflow protects longer labels and future translations. */
+    .filter-group {
+      width: 100%;
+      overflow-x: auto;
+    }
+
+    .filter-group button {
+      flex: 1 0 auto;
+    }
+
+    .search-field {
+      width: 100%;
+      margin-left: 0;
+      background: var(--porcelain);
+    }
+
+    .queue {
+      margin-top: 26px;
+    }
+
+    /* Retain the signature rail while narrowing its reserved column. */
+    .area-section {
+      padding-left: 37px;
+      padding-bottom: 40px;
+    }
+
+    .area-section::before {
+      left: 11px;
+    }
+
+    .rail-stop {
+      left: -11px;
+    }
+
+    .area-heading {
+      grid-template-columns: 32px minmax(0, 1fr);
+      gap: 9px;
+    }
+
+    .area-icon {
+      width: 32px;
+      height: 32px;
+      border-radius: 9px;
+    }
+
+    .area-heading p {
+      font-size: 0.75rem;
+    }
+
+    .entry-row {
+      grid-template-columns: 44px minmax(0, 1fr) 44px;
+      padding: 15px 8px 15px 5px;
+    }
+
+    .check-control {
+      width: 44px;
+    }
+
+    .entry-copy h3 {
+      font-size: 0.9rem;
+    }
+
+    .entry-copy > p {
+      font-size: 0.79rem;
+    }
+
+    .entry-link,
+    .entry-link-spacer {
+      width: 44px;
+    }
+  }
+
+  /* Respect the operating-system preference while preserving final UI states. */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      scroll-behavior: auto !important;
+      transition-duration: 0.01ms !important;
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+    }
+  }

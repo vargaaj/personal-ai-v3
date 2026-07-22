@@ -1,0 +1,25 @@
+<!doctype html>
+<!--
+  Minimal Vite entry document for the working application. Product structure
+  remains in React so this file only defines browser metadata and the mount.
+-->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- Required for the responsive shell to use the device width on mobile. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- Match browser chrome to the Milkglass application background. -->
+    <meta name="theme-color" content="#F3F6F2" />
+    <meta
+      name="description"
+      content="A calm personal console for reviewing recurring work."
+    />
+    <title>Personal Review</title>
+  </head>
+  <body>
+    <!-- React verifies this mount exists before creating the application root. -->
+    <div id="root"></div>
+    <!-- Vite treats this TSX module as the dependency graph entry point. -->
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

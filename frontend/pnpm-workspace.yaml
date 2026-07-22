@@ -1,0 +1,4 @@
+# The bundled pnpm security policy created this narrow exception for the exact
+# Vite version pinned by package.json; other dependencies retain normal policy.
+minimumReleaseAgeExclude:
+  - vite@8.1.5

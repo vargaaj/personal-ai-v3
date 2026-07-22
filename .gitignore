@@ -1,0 +1,2 @@
+# Local environment files can contain API keys and other machine-specific secrets.
+.env.local
