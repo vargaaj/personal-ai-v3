@@ -3,7 +3,7 @@
  *
  * This file intentionally contains only application bootstrapping and global
  * asset imports. Product behavior belongs in App.tsx, while backend-facing
- * data access will live behind the frontend data layer in a later increment.
+ * data access lives behind the frontend data module in `data/areaContentApi.ts`.
  */
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";

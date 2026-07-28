@@ -361,6 +361,81 @@
     line-height: 1.58;
   }
 
+  /* Weekly regeneration is intentionally grouped with session context instead
+     of queue filters: it changes the underlying Health and Meals documents,
+     while Open/All/Done only changes which saved rows are visible. */
+  .page-actions {
+    flex: 0 0 264px;
+    display: grid;
+    justify-items: end;
+    gap: 8px;
+  }
+
+  .weekly-update-button {
+    min-height: 44px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 9px;
+    padding: 0 15px;
+    border: 1px solid var(--graphite);
+    border-radius: 9px;
+    background: var(--graphite);
+    box-shadow: 0 8px 20px rgba(24, 34, 31, 0.12);
+    color: var(--porcelain);
+    cursor: pointer;
+    font-size: 0.75rem;
+    font-weight: 620;
+    transition:
+      background 150ms ease,
+      box-shadow 150ms ease,
+      transform 150ms ease;
+  }
+
+  .weekly-update-button:hover:not(:disabled) {
+    background: var(--juniper);
+    box-shadow: 0 10px 24px rgba(47, 107, 95, 0.18);
+    transform: translateY(-1px);
+  }
+
+  /* Disabling the control prevents overlapping OpenRouter requests. The label
+     and rotating icon continue to explain why it cannot currently be clicked. */
+  .weekly-update-button:disabled {
+    cursor: wait;
+    opacity: 0.72;
+  }
+
+  .weekly-update-button .is-spinning,
+  .area-update-button .is-spinning {
+    animation: weekly-update-spin 900ms linear infinite;
+  }
+
+  @keyframes weekly-update-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+
+  /* Result copy is deliberately compact but visible. Color supplements the
+     complete sentence and never carries success or failure meaning by itself. */
+  .weekly-update-message {
+    max-width: 264px;
+    margin: 0;
+    color: var(--muted);
+    font-size: 0.68rem;
+    line-height: 1.45;
+    text-align: right;
+  }
+
+  .weekly-update-message.is-success {
+    color: var(--juniper);
+  }
+
+  .weekly-update-message.is-partial,
+  .weekly-update-message.is-error {
+    color: #855f12;
+  }
+
   /* Supporting session context, intentionally not a dashboard metric card. */
   .cleared-note {
     flex: 0 0 auto;
@@ -587,10 +662,16 @@
 
   .area-heading {
     display: grid;
-    grid-template-columns: 36px minmax(0, 1fr);
+    grid-template-columns: 36px minmax(0, 1fr) auto;
     align-items: start;
     gap: 12px;
     margin-bottom: 13px;
+  }
+
+  /* This middle column is allowed to shrink around long descriptions without
+     pushing the section-level update control outside the review surface. */
+  .area-heading-copy {
+    min-width: 0;
   }
 
   /* color-mix derives quiet tints from the small, named accent palette instead
@@ -627,12 +708,79 @@
     letter-spacing: 0.03em;
   }
 
-  .area-heading p {
+  .area-heading-copy > p {
     max-width: 680px;
     margin: 3px 0 0;
     color: var(--muted);
     font-size: 0.78rem;
     line-height: 1.45;
+  }
+
+  /* Health and Meals each receive a quiet, accent-tinted action in their own
+     heading. The darker page-header action remains the primary way to refresh
+     both plans; these controls communicate their narrower section scope. */
+  .area-update-actions {
+    width: min(220px, 22vw);
+    display: grid;
+    justify-items: end;
+    gap: 6px;
+  }
+
+  .area-update-button {
+    min-height: 44px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    padding: 0 13px;
+    border: 1px solid color-mix(in srgb, var(--area-accent) 34%, var(--line));
+    border-radius: 9px;
+    background: color-mix(in srgb, var(--area-accent) 6%, var(--porcelain));
+    color: var(--area-accent);
+    cursor: pointer;
+    font-size: 0.7rem;
+    font-weight: 650;
+    white-space: nowrap;
+    transition:
+      border-color 150ms ease,
+      background 150ms ease,
+      transform 150ms ease;
+  }
+
+  .area-update-button:hover:not(:disabled) {
+    border-color: color-mix(in srgb, var(--area-accent) 62%, var(--line));
+    background: color-mix(in srgb, var(--area-accent) 11%, var(--porcelain));
+    transform: translateY(-1px);
+  }
+
+  /* Every update control is disabled while either the combined or an individual
+     model request is active. Only the button that started the request announces
+     itself as busy; the other disabled controls use the standard blocked cursor. */
+  .area-update-button:disabled {
+    cursor: not-allowed;
+    opacity: 0.58;
+  }
+
+  .area-update-button[aria-busy="true"] {
+    cursor: wait;
+    opacity: 0.72;
+  }
+
+  .area-update-message {
+    max-width: 220px;
+    margin: 0;
+    color: var(--muted);
+    font-size: 0.65rem;
+    line-height: 1.42;
+    text-align: right;
+  }
+
+  .area-update-message.is-success {
+    color: var(--area-accent);
+  }
+
+  .area-update-message.is-error {
+    color: #855f12;
   }
 
   /* ------------------------------------------------------------------------ */
@@ -976,8 +1124,17 @@
       font-size: clamp(2.35rem, 12vw, 3.45rem);
     }
 
+    .page-actions {
+      justify-items: start;
+      margin-top: 18px;
+    }
+
+    .weekly-update-message {
+      text-align: left;
+    }
+
     .cleared-note {
-      margin-top: 15px;
+      margin-top: 0;
     }
 
     .queue-tools {
@@ -1027,13 +1184,27 @@
       gap: 9px;
     }
 
+    /* On narrow screens the action moves beneath the heading copy instead of
+       compressing the plan description into an unreadably thin column. */
+    .area-update-actions {
+      width: 100%;
+      grid-column: 2;
+      justify-items: start;
+      margin-top: 3px;
+    }
+
+    .area-update-message {
+      max-width: 320px;
+      text-align: left;
+    }
+
     .area-icon {
       width: 32px;
       height: 32px;
       border-radius: 9px;
     }
 
-    .area-heading p {
+    .area-heading-copy > p {
       font-size: 0.75rem;
     }
 

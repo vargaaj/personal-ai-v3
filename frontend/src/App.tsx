@@ -1,14 +1,16 @@
 /**
- * The first usable Review screen and its temporary client-side behavior.
+ * The interactive Review screen backed by the Go areas API.
  *
- * This component composes the responsive shell, derives the cross-area queue,
- * and applies in-memory completion updates. It depends only on frontend domain
- * models. A later data-service module can replace the fixture and save changes
- * without changing the words or structures the interface renders.
+ * This component loads translated `ReviewArea` objects through the frontend
+ * data module, composes the responsive shell, derives the cross-area queue, and
+ * applies completion updates in browser memory. Loading the saved JSON and
+ * saving later LLM updates are separate responsibilities; this screen never
+ * reads Supabase or understands database document shapes directly.
  */
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowSquareOut,
+  ArrowsClockwise,
   Check,
   CheckCircle,
   EnvelopeSimple,
@@ -22,8 +24,63 @@ import {
   Wallet,
   X,
 } from "@phosphor-icons/react";
-import type { AreaId, EntryState, QueueFilter } from "./domain/review";
-import { initialAreas } from "./fixtures/reviewAreas";
+import {
+  fetchReviewAreaSnapshot,
+  requestAreaContentUpdate,
+  requestWeeklyAreaUpdate,
+} from "./data/areaContentApi";
+import type { WeeklyPlanAreaId } from "./data/areaContentApi";
+import type { AreaId, EntryState, QueueFilter, ReviewArea } from "./domain/review";
+
+/** The three visible phases of the initial `/api/areas` request. */
+type AreaLoadState = "loading" | "ready" | "error";
+
+/** The visible phases of a person-triggered Health and Meals regeneration. */
+type WeeklyUpdateState = "idle" | "updating" | "success" | "partial" | "error";
+
+/** The visible phases and explanatory copy for one section-level update. */
+interface AreaUpdateFeedback {
+  state: "updating" | "success" | "error";
+  message: string;
+}
+
+/**
+ * Supplies the user-facing name for each area with an individual update button.
+ * Keeping this map exhaustive means a future weekly target must choose its
+ * visible button and status wording when it is added to `WeeklyPlanAreaId`.
+ */
+const weeklyPlanAreaNames: Record<WeeklyPlanAreaId, string> = {
+  health: "Health",
+  meals: "Meals",
+};
+
+/**
+ * Narrows a general Review area to one that the backend can regenerate today.
+ *
+ * TypeScript calls this a "type guard." After this function returns true,
+ * App.tsx knows the value is specifically `"health"` or `"meals"` and permits
+ * it to be passed to `requestAreaContentUpdate`.
+ */
+function isWeeklyPlanAreaId(areaId: AreaId): areaId is WeeklyPlanAreaId {
+  return areaId === "health" || areaId === "meals";
+}
+
+/**
+ * Formats one backend timestamp in the browser's local timezone.
+ *
+ * Including the date keeps an area last refreshed yesterday or last week from
+ * looking like it changed today. The data adapter has already validated the
+ * timestamp before this display helper receives it.
+ */
+function formatAreaUpdatedAt(updatedAt: string): string {
+  return new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(new Date(updatedAt));
+}
 
 // Keep the label mapping exhaustive so adding a filter state produces a type
 // error until its user-facing copy is also chosen.
@@ -68,10 +125,48 @@ function AreaGlyph({ areaId, size = 19 }: { areaId: AreaId; size?: number }) {
 }
 
 export default function ReviewApp() {
-  // `areas` is the temporary data source stored in browser memory. When an
-  // entry changes, the code creates updated copies instead of editing the
-  // imported fixture itself. A backend response can replace this state later.
-  const [areas, setAreas] = useState(initialAreas);
+  // The page begins without fixture content. Once fetchReviewAreaSnapshot
+  // translates the Go response, storing its areas here causes the sidebar,
+  // counts, and review sections to rerender from database-backed data together.
+  const [areas, setAreas] = useState<ReviewArea[]>([]);
+
+  // Each timestamp belongs to one stored area document. Keeping this metadata
+  // beside, rather than inside, the ReviewArea domain model avoids pretending
+  // that fixture-only areas have a persisted update time. Reloading after any
+  // successful refresh replaces this map with the timestamps returned by Go.
+  const [updatedAtByArea, setUpdatedAtByArea] = useState<
+    Partial<Record<AreaId, string>>
+  >({});
+
+  // Load state distinguishes a legitimate empty database from a request that
+  // is still running or failed. Incrementing `loadAttempt` after an error reruns
+  // the effect below without coupling App.tsx to fetch implementation details.
+  const [areaLoadState, setAreaLoadState] = useState<AreaLoadState>("loading");
+  const [areaLoadError, setAreaLoadError] = useState("");
+  const [loadAttempt, setLoadAttempt] = useState(0);
+
+  // The weekly update has its own state because it is a longer POST request,
+  // separate from loading the currently saved areas. While it is "updating,"
+  // the button is disabled so a double-click cannot start overlapping model
+  // requests for the same Health and Meals documents.
+  const [weeklyUpdateState, setWeeklyUpdateState] = useState<WeeklyUpdateState>("idle");
+  const [weeklyUpdateMessage, setWeeklyUpdateMessage] = useState("");
+
+  // Health and Meals keep separate feedback so a person who clicks the Health
+  // button sees the result beside Health rather than in the page-level weekly
+  // update message. A missing key means that section has not been updated during
+  // this browser session.
+  const [areaUpdateFeedback, setAreaUpdateFeedback] = useState<
+    Partial<Record<WeeklyPlanAreaId, AreaUpdateFeedback>>
+  >({});
+
+  // Only one model update may run at a time. This prevents an individual Health
+  // request and the combined weekly request from loading the same revision and
+  // racing to save different replacements.
+  const individualUpdateRunning =
+    areaUpdateFeedback.health?.state === "updating" ||
+    areaUpdateFeedback.meals?.state === "updating";
+  const updateInProgress = weeklyUpdateState === "updating" || individualUpdateRunning;
 
   // Area selection, text search, and the Open/All/Completed filter are stored
   // separately. A person can therefore combine them—for example, show only
@@ -99,6 +194,38 @@ export default function ReviewApp() {
   // Completion changes are announced separately instead of making the entire
   // queue a live region, which would be excessively noisy for screen readers.
   const [announcement, setAnnouncement] = useState("");
+
+  // Load every configured area when the screen mounts or the person retries a
+  // failed request. AbortController cancels the browser request when React
+  // unmounts this screen or starts a newer attempt, preventing an older response
+  // from replacing newer state. React StrictMode intentionally runs effects an
+  // extra time during development; canceling cleanup makes that behavior safe.
+  useEffect(() => {
+    const requestController = new AbortController();
+
+    setAreaLoadState("loading");
+    setAreaLoadError("");
+
+    fetchReviewAreaSnapshot(requestController.signal)
+      .then((snapshot) => {
+        if (requestController.signal.aborted) return;
+
+        // Store content and timestamps from the same response so a section
+        // cannot show refreshed rows beside metadata from an older request.
+        setAreas(snapshot.areas);
+        setUpdatedAtByArea(snapshot.updatedAtByArea);
+        setAreaLoadState("ready");
+      })
+      .catch((error: unknown) => {
+        if (requestController.signal.aborted) return;
+
+        const message = error instanceof Error ? error.message : "Unable to load review areas.";
+        setAreaLoadError(message);
+        setAreaLoadState("error");
+      });
+
+    return () => requestController.abort();
+  }, [loadAttempt]);
 
   // Global counts are derived from the same state as the rows so header and
   // navigation totals cannot drift after an in-memory completion change.
@@ -267,6 +394,137 @@ export default function ReviewApp() {
   }
 
   /**
+   * Retries the complete areas request after a visible loading error.
+   *
+   * The error panel's "Try again" button calls this function. Changing the
+   * attempt number triggers the loading effect above, which clears the old
+   * message and requests a fresh snapshot from Go.
+   */
+  function retryAreaLoad() {
+    setLoadAttempt((currentAttempt) => currentAttempt + 1);
+  }
+
+  /**
+   * Regenerates the saved Health and Meals plans after a button click.
+   *
+   * The POST request does not finish until Go has called OpenRouter, validated
+   * the returned JSON, and attempted to save both documents. Successful or
+   * partially successful runs increment `loadAttempt`, which reruns the GET
+   * effect above and replaces the visible rows with the latest saved content.
+   */
+  async function updateWeeklyPlans() {
+    // The disabled button normally prevents a second call. This guard also
+    // protects the function if it is invoked programmatically while one request
+    // is already in progress.
+    if (updateInProgress) return;
+
+    setWeeklyUpdateState("updating");
+    setWeeklyUpdateMessage("Updating Health and Meals. This can take a minute.");
+
+    try {
+      const results = await requestWeeklyAreaUpdate();
+      const failedResults = results.filter((result) => result.status === "failed");
+      const savedResults = results.filter((result) => result.status !== "failed");
+
+      // Reload when at least one document was saved or confirmed current. A
+      // partial result should still reveal the section that updated correctly.
+      if (savedResults.length > 0) {
+        setLoadAttempt((currentAttempt) => currentAttempt + 1);
+      }
+
+      if (failedResults.length === 0 && results.length > 0) {
+        setWeeklyUpdateState("success");
+        setWeeklyUpdateMessage("Health and Meals updated. The latest weekly plans are now loaded.");
+        return;
+      }
+
+      const failedAreaNames = failedResults.map((result) =>
+        result.areaId.charAt(0).toLocaleUpperCase() + result.areaId.slice(1),
+      );
+      const failedAreaLabel = failedAreaNames.join(" and ") || "The weekly plans";
+
+      if (savedResults.length > 0) {
+        setWeeklyUpdateState("partial");
+        setWeeklyUpdateMessage(
+          `${failedAreaLabel} could not be updated. The other weekly plan is ready.`,
+        );
+        return;
+      }
+
+      setWeeklyUpdateState("error");
+      setWeeklyUpdateMessage(`${failedAreaLabel} could not be updated. Try the update again.`);
+    } catch {
+      // Network and non-successful HTTP responses use stable interface copy.
+      // Detailed provider or database failures remain in the Go server logs.
+      setWeeklyUpdateState("error");
+      setWeeklyUpdateMessage("The weekly plans could not be updated. Check the server and try again.");
+    }
+  }
+
+  /**
+   * Regenerates one plan when its section-level Refresh button is clicked.
+   *
+   * `areaId` identifies either the Health workout document or the Meals
+   * recommendations document. The request remains pending while Go loads that
+   * area's prompt, calls OpenRouter, validates the JSON, and saves the new
+   * revision. A successful result reloads `/api/areas`, which replaces the
+   * visible section entries with the newly saved plan.
+   */
+  async function updateAreaPlan(areaId: WeeklyPlanAreaId) {
+    // Disabled controls normally prevent overlap. This guard also protects
+    // programmatic calls made before React has rendered the disabled state.
+    if (updateInProgress) return;
+
+    const areaName = weeklyPlanAreaNames[areaId];
+    setAreaUpdateFeedback((currentFeedback) => ({
+      ...currentFeedback,
+      [areaId]: {
+        state: "updating",
+        message: `Updating ${areaName}. This can take a minute.`,
+      },
+    }));
+
+    try {
+      const result = await requestAreaContentUpdate(areaId);
+
+      // A per-area failure is a completed HTTP response, but Go did not save a
+      // new revision. Leave the current entries on screen and explain the result
+      // beside the button that started the request.
+      if (result.status === "failed") {
+        setAreaUpdateFeedback((currentFeedback) => ({
+          ...currentFeedback,
+          [areaId]: {
+            state: "error",
+            message: `${areaName} could not be updated. Try the update again.`,
+          },
+        }));
+        return;
+      }
+
+      // Incrementing this counter reruns the existing areas GET effect. The
+      // section then renders the database revision that Go just saved.
+      setLoadAttempt((currentAttempt) => currentAttempt + 1);
+      setAreaUpdateFeedback((currentFeedback) => ({
+        ...currentFeedback,
+        [areaId]: {
+          state: "success",
+          message: `${areaName} updated. The latest plan is now loaded.`,
+        },
+      }));
+    } catch {
+      // Detailed database and provider failures remain in the Go server logs;
+      // the visible message stays useful without exposing internal information.
+      setAreaUpdateFeedback((currentFeedback) => ({
+        ...currentFeedback,
+        [areaId]: {
+          state: "error",
+          message: `${areaName} could not be updated. Check the server and try again.`,
+        },
+      }));
+    }
+  }
+
+  /**
    * Shows one selected area instead of the full cross-area queue.
    *
    * Sidebar buttons and cadence-rail dots call this function. For example,
@@ -338,7 +596,7 @@ export default function ReviewApp() {
     setAreas((currentAreas) =>
       // Return the existing object for every area and entry that did not change.
       // Only the selected entry gets a new copy with its new state. This avoids
-      // changing the imported fixture and helps React skip unnecessary updates.
+      // mutating the loaded API snapshot and helps React skip unnecessary updates.
       currentAreas.map((area) => {
         if (area.id !== areaId) return area;
 
@@ -434,9 +692,6 @@ export default function ReviewApp() {
           })}
         </nav>
 
-        <div className="sidebar-foot">
-          <p><span className="sync-dot" /> Last reviewed today at 8:32 AM</p>
-        </div>
       </aside>
 
       {/* This compact header exists only below the desktop breakpoint and keeps
@@ -464,16 +719,52 @@ export default function ReviewApp() {
           <header className="page-header">
             <div>
               <p className="eyebrow">Daily review · {dateLabel}</p>
-              <h1>{activeAreaName ? `${activeAreaName}, at a glance.` : "What needs a decision."}</h1>
+              <h1>{activeAreaName ? `${activeAreaName}, at a glance.` : "What needs your attention."}</h1>
               <p className="page-summary">
-                {activeAreaName
-                  ? `A focused view of the open work in ${activeAreaName.toLocaleLowerCase()}.`
-                  : `${openCount} entries are open across ${openAreaCount} ${openAreaCount === 1 ? "area" : "areas"}. Start at the top or choose an area.`}
+                {areaLoadState === "loading"
+                  ? "Loading your current Home, Health, Reading, and Meals review."
+                  : areaLoadState === "error"
+                    ? "Your saved review data could not be loaded. You can retry below."
+                    : activeAreaName
+                      ? `A focused view of the open work in ${activeAreaName.toLocaleLowerCase()}.`
+                      : `${openCount} entries are open across ${openAreaCount} ${openAreaCount === 1 ? "area" : "areas"}. Start at the top or choose an area.`}
               </p>
             </div>
-            <div className="cleared-note" aria-label={`${doneCount} completed entries`}>
-              <CheckCircle size={20} weight="duotone" aria-hidden="true" />
-              <span><strong>{doneCount} cleared</strong><small>done</small></span>
+            {/* This compact action column keeps the expensive weekly refresh
+                separate from ordinary queue filters. Its message remains visible
+                after completion so success or partial failure is not conveyed
+                only through the temporary button label. */}
+            <div className="page-actions">
+              <button
+                className="weekly-update-button"
+                type="button"
+                onClick={updateWeeklyPlans}
+                disabled={updateInProgress}
+                aria-busy={weeklyUpdateState === "updating"}
+              >
+                <ArrowsClockwise
+                  className={weeklyUpdateState === "updating" ? "is-spinning" : ""}
+                  size={18}
+                  aria-hidden="true"
+                />
+                {weeklyUpdateState === "updating"
+                  ? "Updating weekly plans…"
+                  : "Refresh weekly plans"}
+              </button>
+
+              <div className="cleared-note" aria-label={`${doneCount} completed entries`}>
+                <CheckCircle size={20} weight="duotone" aria-hidden="true" />
+                <span><strong>{doneCount} cleared</strong><small>done</small></span>
+              </div>
+
+              {weeklyUpdateMessage && (
+                <p
+                  className={`weekly-update-message is-${weeklyUpdateState}`}
+                  role={weeklyUpdateState === "error" ? "alert" : "status"}
+                >
+                  {weeklyUpdateMessage}
+                </p>
+              )}
             </div>
           </header>
 
@@ -507,13 +798,40 @@ export default function ReviewApp() {
           </section>
 
           {/* The queue is grouped by recognizable life areas rather than by an
-              implementation-specific loop or file structure. */}
+              implementation-specific loop or file structure. Loading and error
+              states occupy this same region so the page does not briefly claim
+              that an empty queue was returned while the request is in flight. */}
           <div className="queue">
-            {visibleAreas.length > 0 ? (
+            {areaLoadState === "loading" ? (
+              <section className="empty-state" role="status" aria-live="polite">
+                <h2>Loading your review…</h2>
+                <p>Getting the latest saved areas from the server.</p>
+              </section>
+            ) : areaLoadState === "error" ? (
+              <section className="empty-state" role="alert">
+                <h2>Unable to load your review.</h2>
+                <p>{areaLoadError}</p>
+                <button type="button" onClick={retryAreaLoad}>Try again</button>
+              </section>
+            ) : areas.length === 0 ? (
+              <section className="empty-state">
+                <h2>No review areas are available yet.</h2>
+                <p>Add area content in Supabase, then reload this page.</p>
+              </section>
+            ) : visibleAreas.length > 0 ? (
               visibleAreas.map((area) => {
                 // This count describes the currently visible copy in open mode;
                 // other filters switch the label to a neutral "shown" count.
                 const areaOpenCount = area.entries.filter((entry) => entry.state === "open").length;
+                const areaUpdatedAt = updatedAtByArea[area.id];
+
+                // Only Health and Meals currently have stored update prompts.
+                // Narrowing here lets the rest of the section render normally
+                // for every area while adding controls only to those two.
+                const weeklyPlanAreaId = isWeeklyPlanAreaId(area.id) ? area.id : null;
+                const updateFeedback = weeklyPlanAreaId
+                  ? areaUpdateFeedback[weeklyPlanAreaId]
+                  : undefined;
                 return (
                   <section className={`area-section accent-${area.accent}`} aria-labelledby={`area-${area.id}`} key={area.id}>
                     {/* The rail stop is functional navigation, not decoration.
@@ -530,7 +848,7 @@ export default function ReviewApp() {
 
                     <div className="area-heading">
                       <span className="area-icon"><AreaGlyph areaId={area.id} size={20} /></span>
-                      <div>
+                      <div className="area-heading-copy">
                         <div className="area-title-line">
                           <h2 id={`area-${area.id}`}>{area.name}</h2>
                           <span className="area-count">
@@ -538,7 +856,49 @@ export default function ReviewApp() {
                           </span>
                         </div>
                         <p>{area.description}</p>
+                        {areaUpdatedAt && (
+                          // The machine-readable value preserves the exact
+                          // backend instant while the text uses local time.
+                          <p>
+                            <time dateTime={areaUpdatedAt}>
+                              Last updated at {formatAreaUpdatedAt(areaUpdatedAt)}
+                            </time>
+                          </p>
+                        )}
                       </div>
+
+                      {weeklyPlanAreaId && (
+                        <div className="area-update-actions">
+                          {/* This secondary action refreshes only the section
+                              whose heading contains it. All refresh controls are
+                              disabled during the request to avoid revision races. */}
+                          <button
+                            className="area-update-button"
+                            type="button"
+                            onClick={() => updateAreaPlan(weeklyPlanAreaId)}
+                            disabled={updateInProgress}
+                            aria-busy={updateFeedback?.state === "updating"}
+                          >
+                            <ArrowsClockwise
+                              className={updateFeedback?.state === "updating" ? "is-spinning" : ""}
+                              size={16}
+                              aria-hidden="true"
+                            />
+                            {updateFeedback?.state === "updating"
+                              ? `Updating ${area.name}…`
+                              : `Refresh ${area.name}`}
+                          </button>
+
+                          {updateFeedback && (
+                            <p
+                              className={`area-update-message is-${updateFeedback.state}`}
+                              role={updateFeedback.state === "error" ? "alert" : "status"}
+                            >
+                              {updateFeedback.message}
+                            </p>
+                          )}
+                        </div>
+                      )}
                     </div>
 
                     <div className="entry-list">
