@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,10 +25,16 @@ import (
 //  2. updateTarget loads the current JSON for one document.
 //  3. A scheduled run stops there when that document was already updated this
 //     week. This is why its prompt is not fetched during ordinary due checks.
-//  4. A due or manually forced run loads the matching database prompt.
-//  5. buildCalendarUpdatePrompt adds this week's actual dates to that prompt.
-//  6. updateJSON asks OpenRouter for replacement JSON and validates its shape.
-//  7. saveAreaContent stores it only if another request has not already changed
+//  4. A due or manually forced run tries to claim a database lock for that
+//     document. The lock works across Cloud Run instances, not only inside one
+//     Go process. An overlapping request that cannot claim it stops immediately.
+//  5. A request that claimed the lock reloads the document. If another request
+//     saved a newer revision between the first read and the lock attempt, this
+//     request also stops without calling the model a second time.
+//  6. The runner loads the matching database prompt.
+//  7. buildCalendarUpdatePrompt adds this week's actual dates to that prompt.
+//  8. updateJSON asks OpenRouter for replacement JSON and validates its shape.
+//  9. saveAreaContent stores it only if another writer has not already changed
 //     the document's revision.
 
 // areaUpdateTarget identifies one independently stored document that participates
@@ -53,6 +60,13 @@ var weeklyAreaUpdateTargets = []areaUpdateTarget{
 // area/content pair from an operational database or OpenRouter failure. The
 // browser receives a safe 404 without exposing the internal error text.
 var errAreaUpdateTargetNotConfigured = errors.New("area update target is not configured")
+
+const (
+	// Releasing a lock must not reuse a canceled HTTP request context. This short
+	// independent deadline gives PostgreSQL time to unlock the session while
+	// preventing a broken database connection from hanging request cleanup.
+	areaUpdateUnlockTimeout = 5 * time.Second
+)
 
 // areaUpdateStatus describes the visible outcome of one target. The scheduler
 // logs these results, while the future manual endpoint can return the same
@@ -87,6 +101,128 @@ type areaUpdateRunner struct {
 	// targets identifies the documents this runner should update. Production
 	// leaves it empty to use weeklyAreaUpdateTargets.
 	targets []areaUpdateTarget
+}
+
+// areaUpdateLock owns the one database session that holds a PostgreSQL advisory
+// lock. Advisory locks belong to sessions, so the same *sql.Conn must remain
+// reserved until release runs; returning it to the pool earlier could let an
+// unrelated query inherit a lock that it does not know how to release.
+type areaUpdateLock struct {
+	conn *sql.Conn
+	key  string
+}
+
+// areaUpdateLockKey creates one stable namespace for an area/content pair.
+// Prefixing the area id with its length keeps pairs unambiguous even if a future
+// identifier contains punctuation also used by the other identifier.
+func areaUpdateLockKey(target areaUpdateTarget) string {
+	return fmt.Sprintf("%d:%s%s", len(target.AreaID), target.AreaID, target.ContentType)
+}
+
+// tryAcquireAreaUpdateLock attempts to claim this target for one update.
+//
+// pg_try_advisory_lock returns immediately instead of making a second browser or
+// scheduler request wait for a potentially long OpenRouter call. A failed claim
+// is reported as "skipped" by updateTarget. The successful connection remains
+// reserved in areaUpdateLock until release is called because PostgreSQL advisory
+// locks belong to the session that acquired them.
+func tryAcquireAreaUpdateLock(
+	ctx context.Context,
+	db *sql.DB,
+	target areaUpdateTarget,
+) (*areaUpdateLock, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if db == nil {
+		return nil, false, errors.New("database is required")
+	}
+
+	lockKey := areaUpdateLockKey(target)
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return nil, false, fmt.Errorf(
+			"reserve %s/%s update lock connection: %w",
+			target.AreaID,
+			target.ContentType,
+			err,
+		)
+	}
+
+	var acquired bool
+	err = conn.QueryRowContext(
+		ctx,
+		`SELECT pg_try_advisory_lock(hashtextextended($1, 0))`,
+		lockKey,
+	).Scan(&acquired)
+	if err != nil {
+		_ = conn.Close()
+		return nil, false, fmt.Errorf(
+			"acquire %s/%s update lock: %w",
+			target.AreaID,
+			target.ContentType,
+			err,
+		)
+	}
+	if acquired {
+		return &areaUpdateLock{
+			conn: conn,
+			key:  lockKey,
+		}, true, nil
+	}
+
+	// This connection did not acquire a lock and therefore has no session state
+	// that must remain attached to the request.
+	if err := conn.Close(); err != nil {
+		return nil, false, fmt.Errorf(
+			"release unused %s/%s update lock connection: %w",
+			target.AreaID,
+			target.ContentType,
+			err,
+		)
+	}
+	return nil, false, nil
+}
+
+// release relinquishes the advisory lock and returns its reserved connection to
+// the pool. It uses an independent context because a browser disconnect or Cloud
+// Run request timeout must not leave a lock attached to a pooled session.
+func (lock *areaUpdateLock) release() error {
+	if lock == nil || lock.conn == nil {
+		return errors.New("area update lock connection is required")
+	}
+
+	releaseContext, cancelRelease := context.WithTimeout(
+		context.Background(),
+		areaUpdateUnlockTimeout,
+	)
+	defer cancelRelease()
+
+	var released bool
+	releaseError := lock.conn.QueryRowContext(
+		releaseContext,
+		`SELECT pg_advisory_unlock(hashtextextended($1, 0))`,
+		lock.key,
+	).Scan(&released)
+	if releaseError != nil || !released {
+		// A session with an uncertain lock state must never return to the shared
+		// pool. driver.ErrBadConn tells database/sql to discard this physical
+		// connection, and PostgreSQL releases session locks when it closes.
+		_ = lock.conn.Raw(func(any) error {
+			return driver.ErrBadConn
+		})
+		_ = lock.conn.Close()
+
+		if releaseError != nil {
+			return fmt.Errorf("release database advisory lock: %w", releaseError)
+		}
+		return errors.New("database advisory lock was not held")
+	}
+
+	if err := lock.conn.Close(); err != nil {
+		return fmt.Errorf("return update lock connection to pool: %w", err)
+	}
+	return nil
 }
 
 // run refreshes every configured target independently. Scheduled calls pass
@@ -223,8 +359,8 @@ func (runner areaUpdateRunner) updateTarget(
 	now time.Time,
 	force bool,
 	target areaUpdateTarget,
-) AreaUpdateResult {
-	result := AreaUpdateResult{
+) (result AreaUpdateResult) {
+	result = AreaUpdateResult{
 		AreaID:      target.AreaID,
 		ContentType: target.ContentType,
 		Status:      areaUpdateStatusFailed,
@@ -239,6 +375,88 @@ func (runner areaUpdateRunner) updateTarget(
 	// This check intentionally precedes loadPrompt. The hourly scheduler may read
 	// lightweight content metadata many times during a week, but it retrieves the
 	// potentially long prompt only on the run that will use it.
+	if !force && !weeklyAreaUpdateDue(current.UpdatedAt, now) {
+		result.Status = areaUpdateStatusSkipped
+		result.Revision = current.Revision
+		result.UpdatedAt = current.UpdatedAt
+		return result
+	}
+
+	// Serialize the expensive part of the workflow across every Cloud Run
+	// instance. An in-memory mutex would only coordinate requests handled by one
+	// process, while PostgreSQL advisory locks are visible to every instance that
+	// uses this database.
+	updateLock, acquired, err := tryAcquireAreaUpdateLock(ctx, runner.db, target)
+	if err != nil {
+		result.Error = fmt.Errorf(
+			"lock %s/%s update: %w",
+			target.AreaID,
+			target.ContentType,
+			err,
+		)
+		return result
+	}
+	if !acquired {
+		// Another request is already updating this exact document. Treat it as a
+		// successful skip so this request neither spends model quota nor reports an
+		// operational failure for expected overlap.
+		result.Status = areaUpdateStatusSkipped
+		result.Revision = current.Revision
+		result.UpdatedAt = current.UpdatedAt
+		return result
+	}
+	defer func() {
+		if releaseError := updateLock.release(); releaseError != nil {
+			wrappedReleaseError := fmt.Errorf(
+				"release %s/%s update lock: %w",
+				target.AreaID,
+				target.ContentType,
+				releaseError,
+			)
+
+			// Preserve an earlier load, model, or save failure while still making
+			// the lock-cleanup failure visible in server logs. If the content was
+			// otherwise saved successfully, report a failed result because an
+			// unreleased pooled lock could prevent all later refreshes.
+			if result.Error != nil {
+				result.Error = errors.Join(result.Error, wrappedReleaseError)
+			} else {
+				result.Status = areaUpdateStatusFailed
+				result.Error = wrappedReleaseError
+			}
+		}
+	}()
+
+	// Another request may have completed while this request waited for the lock.
+	// Reloading under the lock reveals its new revision before any prompt or
+	// OpenRouter work begins.
+	lockedCurrent, err := loadAreaContent(
+		ctx,
+		runner.db,
+		target.AreaID,
+		target.ContentType,
+	)
+	if err != nil {
+		result.Error = fmt.Errorf(
+			"reload locked %s/%s content: %w",
+			target.AreaID,
+			target.ContentType,
+			err,
+		)
+		return result
+	}
+	if lockedCurrent.Revision != current.Revision {
+		result.Status = areaUpdateStatusSkipped
+		result.Revision = lockedCurrent.Revision
+		result.UpdatedAt = lockedCurrent.UpdatedAt
+		return result
+	}
+	current = lockedCurrent
+
+	// Recheck the calendar condition while holding the lock. The revision check
+	// above normally catches a completed competing update, while this condition
+	// also protects scheduled runs if database-maintained timing changes without
+	// a revision change.
 	if !force && !weeklyAreaUpdateDue(current.UpdatedAt, now) {
 		result.Status = areaUpdateStatusSkipped
 		result.Revision = current.Revision
