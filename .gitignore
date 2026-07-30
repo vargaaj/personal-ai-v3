@@ -1,2 +1,8 @@
 # Local environment files can contain API keys and other machine-specific secrets.
 .env.local
+
+# Frontend dependencies are restored from package.json and pnpm-lock.yaml.
+frontend/node_modules/
+
+# Vite recreates production bundles, hashed assets, and bundled web fonts.
+frontend/dist/
