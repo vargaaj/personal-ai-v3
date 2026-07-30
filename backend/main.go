@@ -80,6 +80,7 @@
 //	  |                          -> saveAreaContent(ctx, db, ...)
 //	  |                               Saves only if the revision is unchanged.
 //	  |         -> writeAreaUpdateResultsResponse(...)
+//	  |         -> returns HTTP 500 when either document fails so Scheduler retries
 //	  |         -> duplicate scheduler deliveries safely return skipped results
 //	  |
 //	  +-- server.ListenAndServe()
@@ -91,21 +92,27 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io/fs"
 	"log"
+	"mime"
 	"net/http"
 	"os"
+	"path"
 	"strings"
 	"time"
 
 	"github.com/joho/godotenv"
 )
 
-// serverApplication contains the concrete services used by HTTP requests. The
-// GET handler reads directly through db, and the POST handler calls updater.run
-// directly. This avoids aliases or interfaces that hide which code does the work.
+// serverApplication contains the concrete services used by HTTP requests. API
+// handlers read through db or call updater directly. frontendFiles is optional:
+// Vite serves the interface during local development, while the Cloud Run
+// container supplies the built React files through FRONTEND_DIST_DIR.
 type serverApplication struct {
-	db      *sql.DB
-	updater *localizedAreaUpdater
+	db            *sql.DB
+	updater       *localizedAreaUpdater
+	frontendFiles fs.FS
 }
 
 // localizedAreaUpdater combines the shared update workflow with the timezone
@@ -219,6 +226,26 @@ func main() {
 		db: db,
 	}
 
+	// Local development normally leaves FRONTEND_DIST_DIR empty because Vite
+	// serves the interface on port 5173 and proxies /api requests here. The
+	// production Dockerfile sets this variable to the directory copied into the
+	// final image, allowing this same Go process to serve both the interface and
+	// API from one Cloud Run origin.
+	frontendDirectory := strings.TrimSpace(os.Getenv("FRONTEND_DIST_DIR"))
+	if frontendDirectory != "" {
+		frontendFiles := os.DirFS(frontendDirectory)
+		indexInformation, indexError := fs.Stat(frontendFiles, "index.html")
+		if indexError != nil {
+			log.Fatalf("open frontend index in %s: %v", frontendDirectory, indexError)
+		}
+		if indexInformation.IsDir() {
+			log.Fatalf("frontend index in %s is a directory", frontendDirectory)
+		}
+
+		application.frontendFiles = frontendFiles
+		log.Printf("serving frontend files from %s", frontendDirectory)
+	}
+
 	// Give the update runner the same concrete database pool. updater.go calls
 	// loadAreaContent, loadAreaUpdatePrompt, updateJSON, and saveAreaContent
 	// directly, so there are no loader aliases or anonymous functions here.
@@ -321,7 +348,13 @@ func (application *serverApplication) newHTTPHandler() http.Handler {
 		}
 
 		results, err := application.updater.run(r.Context(), true)
-		writeAreaUpdateResultsResponse(w, "manual", results, err)
+		writeAreaUpdateResultsResponse(
+			w,
+			"manual",
+			results,
+			manualAreaUpdateFailureHTTPStatus,
+			err,
+		)
 	})
 
 	// A Health or Meals section button calls this route to regenerate only its
@@ -346,7 +379,13 @@ func (application *serverApplication) newHTTPHandler() http.Handler {
 			return
 		}
 
-		writeAreaUpdateResultsResponse(w, "manual individual", results, err)
+		writeAreaUpdateResultsResponse(
+			w,
+			"manual individual",
+			results,
+			manualAreaUpdateFailureHTTPStatus,
+			err,
+		)
 	})
 
 	// Google Cloud Scheduler calls this separate endpoint every Sunday morning.
@@ -361,10 +400,135 @@ func (application *serverApplication) newHTTPHandler() http.Handler {
 		}
 
 		results, err := application.updater.run(r.Context(), false)
-		writeAreaUpdateResultsResponse(w, "scheduled", results, err)
+		writeAreaUpdateResultsResponse(
+			w,
+			"scheduled",
+			results,
+			scheduledAreaUpdateFailureHTTPStatus,
+			err,
+		)
 	})
 
+	// When the production container supplies a React bundle, this final
+	// catch-all handles paths that were not claimed by the API routes above.
+	// Registering it without an HTTP method lets the handler return a true 404 for
+	// unsupported POST requests instead of ServeMux turning them into a 405.
+	if application.frontendFiles != nil {
+		mux.Handle("/", newFrontendHandler(application.frontendFiles))
+	}
+
 	return mux
+}
+
+const (
+	// Vite gives production assets content-based names, so a changed JavaScript,
+	// CSS, or font file receives a different URL. Those files can therefore stay
+	// in browser caches for a year without hiding a newer deployment.
+	frontendAssetCacheControl = "public, max-age=31536000, immutable"
+
+	// index.html contains the current hashed asset names. Revalidating it ensures
+	// a returning visitor discovers a new deployment instead of loading asset
+	// URLs from an older page shell.
+	frontendIndexCacheControl = "no-cache"
+)
+
+// newFrontendHandler serves the Vite production bundle from the same origin as
+// the Go API. Exact files such as /assets/index-abc.js are returned directly.
+// A browser navigation such as /review falls back to index.html so React Router
+// can choose the visible screen after the page loads. Unknown API paths never
+// receive HTML, which keeps misspelled frontend requests visible as real 404s.
+func newFrontendHandler(frontendFiles fs.FS) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Browser page loads use GET or HEAD. Rejecting other methods prevents a
+		// misspelled mutation route from being mistaken for an ordinary React
+		// navigation and receiving the application shell.
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			http.NotFound(w, r)
+			return
+		}
+
+		// The registered API routes are more specific and reach their handlers
+		// first. This check covers only unknown API paths that fall through to the
+		// catch-all, preserving a machine-readable 404 boundary instead of sending
+		// index.html to fetch().
+		if r.URL.Path == "/api" || strings.HasPrefix(r.URL.Path, "/api/") {
+			http.NotFound(w, r)
+			return
+		}
+
+		requestedFile := strings.TrimPrefix(path.Clean(r.URL.Path), "/")
+		if requestedFile == "." || requestedFile == "" {
+			writeFrontendFile(
+				w,
+				r,
+				frontendFiles,
+				"index.html",
+				frontendIndexCacheControl,
+			)
+			return
+		}
+
+		fileInformation, statError := fs.Stat(frontendFiles, requestedFile)
+		if statError == nil && !fileInformation.IsDir() {
+			cacheControl := frontendIndexCacheControl
+			if strings.HasPrefix(requestedFile, "assets/") {
+				cacheControl = frontendAssetCacheControl
+			}
+			writeFrontendFile(w, r, frontendFiles, requestedFile, cacheControl)
+			return
+		}
+
+		// Browser navigation requests advertise that they accept HTML. Missing
+		// scripts, fonts, API paths, and other non-page resources should remain
+		// 404s rather than receiving HTML with an incorrect 200 status.
+		if !strings.Contains(r.Header.Get("Accept"), "text/html") {
+			http.NotFound(w, r)
+			return
+		}
+
+		writeFrontendFile(
+			w,
+			r,
+			frontendFiles,
+			"index.html",
+			frontendIndexCacheControl,
+		)
+	})
+}
+
+// writeFrontendFile writes one already-selected bundle file. It derives the
+// response type from the extension so browsers interpret HTML, JavaScript, CSS,
+// and bundled fonts correctly. HEAD requests receive the same headers without a
+// body, matching the normal HTTP behavior used by uptime and cache checks.
+func writeFrontendFile(
+	w http.ResponseWriter,
+	r *http.Request,
+	frontendFiles fs.FS,
+	fileName string,
+	cacheControl string,
+) {
+	content, readError := fs.ReadFile(frontendFiles, fileName)
+	if readError != nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	contentType := mime.TypeByExtension(path.Ext(fileName))
+	if contentType == "" {
+		contentType = http.DetectContentType(content)
+	}
+
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", cacheControl)
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(content)))
+	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodHead {
+		return
+	}
+
+	if _, writeError := w.Write(content); writeError != nil {
+		log.Printf("write frontend file %s: %v", fileName, writeError)
+	}
 }
 
 // writeAreaContentsResponse turns a completed database read into the public HTTP
@@ -390,13 +554,30 @@ func writeAreaContentsResponse(w http.ResponseWriter, contents []AreaContent, er
 	}
 }
 
+const (
+	// Manual requests use 207 so the browser's fetch remains successful and can
+	// read the safe per-area results. The Review screen then explains which of
+	// Health or Meals failed without receiving private provider diagnostics.
+	manualAreaUpdateFailureHTTPStatus = http.StatusMultiStatus
+
+	// Scheduled requests use a non-2xx status because Cloud Scheduler considers
+	// every 2xx response delivered successfully. Returning 500 asks Scheduler to
+	// apply its configured retry policy. On a retry, a document that already
+	// succeeded is skipped by the Sunday-week due check, while a failed document
+	// remains due and gets another attempt.
+	scheduledAreaUpdateFailureHTTPStatus = http.StatusInternalServerError
+)
+
 // writeAreaUpdateResultsResponse turns completed manual or scheduled update
 // results into a safe response. trigger identifies which endpoint ran so server
 // logs can distinguish a browser click from a Sunday Cloud Scheduler request.
+// failureHTTPStatus controls whether a per-area failure remains readable by the
+// browser as HTTP 207 or asks Cloud Scheduler to retry through HTTP 500.
 func writeAreaUpdateResultsResponse(
 	w http.ResponseWriter,
 	trigger string,
 	results []AreaUpdateResult,
+	failureHTTPStatus int,
 	err error,
 ) {
 	if err != nil {
@@ -413,9 +594,7 @@ func writeAreaUpdateResultsResponse(
 	responseStatus := http.StatusOK
 	for _, result := range results {
 		if result.Status == areaUpdateStatusFailed {
-			// 207 is still a successful fetch response, but signals that the
-			// returned per-area statuses may contain a mixture of outcomes.
-			responseStatus = http.StatusMultiStatus
+			responseStatus = failureHTTPStatus
 			break
 		}
 	}
@@ -425,6 +604,6 @@ func writeAreaUpdateResultsResponse(
 	w.WriteHeader(responseStatus)
 	encodeError := json.NewEncoder(w).Encode(results)
 	if encodeError != nil {
-		log.Printf("encode manual area update results: %v", encodeError)
+		log.Printf("encode %s area update results: %v", trigger, encodeError)
 	}
 }
