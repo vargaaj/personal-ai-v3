@@ -9,8 +9,11 @@ import {
   adaptAreaContents,
   fetchReviewAreaSnapshot,
   fetchReviewAreas,
+  fetchAreaContentPrompt,
   requestAreaContentUpdate,
   requestWeeklyAreaUpdate,
+  saveAreaContentPrompt,
+  saveAreaEntryState,
 } from "./areaContentApi";
 
 afterEach(() => {
@@ -115,11 +118,49 @@ describe("areaContentApi", () => {
     });
   });
 
+  it("ignores the stored Reading document while that area is retired", () => {
+    const snapshot = adaptAreaContentSnapshot([
+      {
+        area_id: "reading",
+        content_type: "reading_queue",
+        revision: 4,
+        updated_at: "2026-07-22T13:15:00Z",
+        content: {
+          entries: [
+            {
+              id: "saved-article",
+              title: "Read a saved article",
+              state: "open",
+              metadata: [],
+            },
+          ],
+        },
+      },
+    ]);
+
+    // Go may continue returning the existing database row. With no frontend
+    // definition, it creates neither a visible section nor a stale timestamp
+    // that could make the retired area look active elsewhere in the interface.
+    expect(snapshot).toEqual({
+      areas: [],
+      updatedAtByArea: {},
+    });
+  });
+
   it("returns translated areas and their timestamps from the Go endpoint", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
       json: vi.fn().mockResolvedValue([
+        {
+          area_id: "home",
+          content_type: "maintenance_tasks",
+          revision: 2,
+          updated_at: "2026-07-26T09:45:00Z",
+          content: {
+            entries: [],
+          },
+        },
         {
           area_id: "health",
           content_type: "weekly_workout_routine",
@@ -135,8 +176,9 @@ describe("areaContentApi", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(fetchReviewAreaSnapshot()).resolves.toMatchObject({
-      areas: [{ id: "health" }],
+      areas: [{ id: "home" }, { id: "health" }],
       updatedAtByArea: {
+        home: "2026-07-26T09:45:00Z",
         health: "2026-07-22T12:00:00Z",
       },
     });
@@ -161,11 +203,176 @@ describe("areaContentApi", () => {
     });
   });
 
+  it("loads an existing Home prompt through its encoded database route", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({
+        area_id: "home",
+        content_type: "maintenance_tasks",
+        prompt: "Keep maintenance tasks practical.",
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(fetchAreaContentPrompt("home")).resolves.toEqual({
+      areaId: "home",
+      contentType: "maintenance_tasks",
+      prompt: "Keep maintenance tasks practical.",
+    });
+    expect(fetchMock).toHaveBeenCalledWith("/api/areas/home/maintenance_tasks/prompt", {
+      headers: { Accept: "application/json" },
+      signal: undefined,
+    });
+  });
+
+  it("treats a missing enabled prompt as a blank create state", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 404,
+      json: vi.fn(),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(fetchAreaContentPrompt("meals")).resolves.toBeNull();
+  });
+
+  it("saves a prompt without requesting any content regeneration route", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({
+        area_id: "health",
+        content_type: "weekly_workout_routine",
+        prompt: "Prioritize low-impact strength sessions.",
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      saveAreaContentPrompt("health", "Prioritize low-impact strength sessions."),
+    ).resolves.toEqual({
+      areaId: "health",
+      contentType: "weekly_workout_routine",
+      prompt: "Prioritize low-impact strength sessions.",
+    });
+    expect(fetchMock).toHaveBeenCalledWith("/api/areas/health/weekly_workout_routine/prompt", {
+      method: "PUT",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ prompt: "Prioritize low-impact strength sessions." }),
+      signal: undefined,
+    });
+    expect(fetchMock.mock.calls[0]?.[0]).not.toContain("/update");
+  });
+
+  it("rejects blank prompt text before it sends a request", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(saveAreaContentPrompt("home", " \n ")).rejects.toThrow("A prompt cannot be blank.");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("reports a prompt save failure with the existing HTTP error convention", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 500,
+      json: vi.fn(),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(saveAreaContentPrompt("meals", "Use seasonal ingredients.")).rejects.toThrow(
+      "Unable to save meals prompt (HTTP 500).",
+    );
+  });
+
+  it("saves and validates one Home entry state through its encoded route", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({
+        area_id: "home",
+        content_type: "maintenance_tasks",
+        entry_id: "filter / upstairs",
+        state: "done",
+        revision: 7,
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(saveAreaEntryState("home", "filter / upstairs", "done")).resolves.toEqual({
+      areaId: "home",
+      contentType: "maintenance_tasks",
+      entryId: "filter / upstairs",
+      state: "done",
+      revision: 7,
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/areas/home/maintenance_tasks/entries/filter%20%2F%20upstairs/state",
+      {
+        method: "PUT",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ state: "done" }),
+        signal: undefined,
+      },
+    );
+  });
+
+  it("rejects an entry-state response that does not confirm the requested entry", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({
+        area_id: "health",
+        content_type: "weekly_workout_routine",
+        entry_id: "tuesday-cardio",
+        state: "done",
+        revision: 4,
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(saveAreaEntryState("health", "monday-strength", "done")).rejects.toThrow(
+      "The health entry state API returned an unexpected entry.",
+    );
+  });
+
+  it("requires a revision in a successful entry-state response", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({
+        area_id: "health",
+        content_type: "weekly_workout_routine",
+        entry_id: "monday-strength",
+        state: "open",
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(saveAreaEntryState("health", "monday-strength", "open")).rejects.toThrow(
+      "Entry state field revision must be an integer.",
+    );
+  });
+
   it("requests a manual weekly update and translates its safe results", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
       json: vi.fn().mockResolvedValue([
+        {
+          area_id: "home",
+          content_type: "maintenance_tasks",
+          status: "updated",
+          revision: 2,
+          updated_at: "2026-07-26T09:45:00Z",
+        },
         {
           area_id: "health",
           content_type: "weekly_workout_routine",
@@ -184,6 +391,13 @@ describe("areaContentApi", () => {
 
     await expect(requestWeeklyAreaUpdate()).resolves.toEqual([
       {
+        areaId: "home",
+        contentType: "maintenance_tasks",
+        status: "updated",
+        revision: 2,
+        updatedAt: "2026-07-26T09:45:00Z",
+      },
+      {
         areaId: "health",
         contentType: "weekly_workout_routine",
         status: "updated",
@@ -201,6 +415,56 @@ describe("areaContentApi", () => {
       headers: { Accept: "application/json" },
       signal: undefined,
     });
+  });
+
+  it("rejects a bulk refresh response that omits one expected area", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue([
+        { area_id: "home", content_type: "maintenance_tasks", status: "updated" },
+        { area_id: "health", content_type: "weekly_workout_routine", status: "updated" },
+      ]),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(requestWeeklyAreaUpdate()).rejects.toThrow(
+      "The bulk update API returned an unexpected result set.",
+    );
+  });
+
+  it("rejects a bulk refresh response with a duplicate target", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue([
+        { area_id: "home", content_type: "maintenance_tasks", status: "updated" },
+        { area_id: "home", content_type: "maintenance_tasks", status: "skipped" },
+        { area_id: "meals", content_type: "weekly_meal_recommendations", status: "updated" },
+      ]),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(requestWeeklyAreaUpdate()).rejects.toThrow(
+      "The bulk update API returned an unexpected result set.",
+    );
+  });
+
+  it("rejects a bulk refresh response with an unexpected area/content pair", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue([
+        { area_id: "home", content_type: "maintenance_tasks", status: "updated" },
+        { area_id: "health", content_type: "weekly_workout_routine", status: "updated" },
+        { area_id: "mail", content_type: "inbox_summary", status: "updated" },
+      ]),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(requestWeeklyAreaUpdate()).rejects.toThrow(
+      "The bulk update API returned an unexpected result set.",
+    );
   });
 
   it("reports a failed manual weekly-update request", async () => {
@@ -247,6 +511,34 @@ describe("areaContentApi", () => {
         signal: undefined,
       },
     );
+  });
+
+  it("requests Home through the same section-refresh route as Health and Meals", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue([
+        {
+          area_id: "home",
+          content_type: "maintenance_tasks",
+          status: "updated",
+          revision: 6,
+          updated_at: "2026-07-26T13:00:00Z",
+        },
+      ]),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(requestAreaContentUpdate("home")).resolves.toMatchObject({
+      areaId: "home",
+      contentType: "maintenance_tasks",
+      status: "updated",
+    });
+    expect(fetchMock).toHaveBeenCalledWith("/api/areas/home/maintenance_tasks/update", {
+      method: "POST",
+      headers: { Accept: "application/json" },
+      signal: undefined,
+    });
   });
 
   it("rejects an individual update response for the wrong area", async () => {

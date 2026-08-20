@@ -232,7 +232,7 @@ func TestFrontendHandlerSupportsHead(t *testing.T) {
 }
 
 // TestAreaUpdateResultsResponseReturnsSafeResults verifies the public JSON shape
-// returned after the concrete updater completes both sections.
+// returned after the concrete updater completes its requested sections.
 func TestAreaUpdateResultsResponseReturnsSafeResults(t *testing.T) {
 	updatedAt := time.Date(2026, time.July, 24, 12, 0, 0, 0, time.UTC)
 	results := []AreaUpdateResult{

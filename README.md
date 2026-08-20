@@ -2,8 +2,9 @@
 
 A private review console for gathering the small decisions and recurring work
 spread across everyday life. The current Review screen turns independently
-stored Home, Health, Reading, and Meals documents into one responsive,
-accessible queue.
+stored Home, Health, and Meals documents into one responsive, accessible queue.
+Reading is a retired legacy area: stored Reading rows are ignored and are not
+part of the visible product.
 
 The application now runs as one connected system:
 
@@ -14,16 +15,17 @@ React + Vite  --->  Go JSON API  --->  Supabase Postgres
 ```
 
 The browser loads saved area content from Go. Go reads and writes JSON documents
-in Supabase. Health and Meals can be regenerated through OpenRouter from either
-the Review screen or a weekly scheduler request.
+in Supabase. Home, Health, and Meals can each be regenerated through OpenRouter
+manually from the Review screen or automatically through the weekly scheduler.
 
 ## What works today
 
-- Load database-backed Home, Health, Reading, and Meals content.
+- Load the visible database-backed Home, Health, and Meals areas.
 - Review every area together or focus on one area.
 - Filter entries by Open, All, or Done and search their visible content.
-- Mark entries done and restore them for the current browser session.
-- Regenerate Health, Meals, or both from the interface.
+- Persist Home and Health entry state changes through the revision-safe API;
+  Meals entry state remains browser-session-only.
+- Regenerate Home, Health, Meals, or all three from the interface.
 - Show each area's stored update time and report full or partial refresh results.
 - Retry failed initial loads without refreshing the page.
 - Use a responsive desktop sidebar or keyboard-contained mobile drawer.
@@ -45,7 +47,11 @@ the Review screen or a weekly scheduler request.
 `-- backend/
     |-- main.go                     HTTP server and route registration
     |-- storage.go                  Supabase Postgres access
-    |-- updater.go                  Weekly refresh orchestration and validation
+    |-- updater.go                  Refresh orchestration, locking, and persistence
+    |-- area_content_validation.go  Per-content local semantic validation
+    |-- area_entry_state_http.go    Home/Health entry-state PUT route
+    |-- area_prompt_http.go         Area-update prompt HTTP routes
+    |-- response_formats.go         Per-content OpenRouter response schemas
     `-- chat.go                     OpenRouter request boundary
 ```
 
@@ -71,14 +77,15 @@ The frontend currently recognizes these rows from
 
 | Area | `content_type` | Stored collection | Model refresh |
 | --- | --- | --- | --- |
-| Home | `maintenance_tasks` | `entries` | No |
+| Home | `maintenance_tasks` | `entries` | Manual or scheduled |
 | Health | `weekly_workout_routine` | `entries` | Manual or scheduled |
-| Reading | `reading_queue` | `entries` | No |
 | Meals | `weekly_meal_recommendations` | `recommendations` | Manual or scheduled |
 
 Display names, descriptions, colors, and ordering remain frontend-owned.
-Unknown database documents are ignored until a matching frontend definition is
-added. Update instructions for refreshable documents come from
+Reading is intentionally absent from the table because it is retired; matching
+legacy rows are ignored. Other unknown database documents are ignored until a
+matching frontend definition is added. Update instructions for the three
+refreshable documents come from
 `personal_ai.area_update_prompt`.
 
 ## Local development
@@ -90,7 +97,7 @@ added. Update instructions for refreshable documents come from
 - Go 1.26.4 or newer
 - A reachable Supabase Postgres database with the two `personal_ai` tables and
   area rows described above
-- An OpenRouter API key if you want to use Health or Meals refreshes
+- An OpenRouter API key if you want to use Home, Health, or Meals refreshes
 
 Database migrations and seed scripts are not currently included in this
 repository, so a fresh clone still needs access to an already configured
@@ -106,9 +113,9 @@ OPENROUTER_API_KEY=your-openrouter-key
 ```
 
 `DATABASE_URL` is required when the server starts. `OPENROUTER_API_KEY` is only
-read when an update endpoint calls OpenRouter. The backend loads this file for
-local development; deployed environments can provide the same variables
-directly.
+read when a Home, Health, or Meals update endpoint calls OpenRouter. The backend
+loads this file for local development; deployed environments can provide the
+same variables directly.
 
 The server uses port `8081` locally. Set `PORT` in the environment to override
 it.
@@ -139,7 +146,10 @@ processes need to be running for the Review screen to load.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/api/areas` | Return every stored area document |
-| `POST` | `/api/areas/weekly-update` | Force-refresh Health and Meals |
+| `PUT` | `/api/areas/{areaID}/{contentType}/entries/{entryID}/state` | Persist one Home or Health entry's `open`/`done` state with revision safety |
+| `GET` | `/api/areas/{areaID}/{contentType}/prompt` | Return one enabled refresh prompt |
+| `PUT` | `/api/areas/{areaID}/{contentType}/prompt` | Create or replace a refresh prompt without regenerating content |
+| `POST` | `/api/areas/weekly-update` | Force-refresh Home, Health, and Meals |
 | `POST` | `/api/areas/{areaID}/{contentType}/update` | Force-refresh one configured weekly document |
 | `POST` | `/api/areas/scheduled-weekly-update` | Refresh weekly documents only when due |
 
@@ -147,9 +157,28 @@ The scheduled route is designed for Google Cloud Scheduler. Weekly plans use a
 Sunday-through-Saturday week in `America/New_York`; repeat scheduler deliveries
 skip documents already refreshed in that week. Database advisory locks and
 revision checks also prevent overlapping browser, scheduler, or Cloud Run
-requests from saving competing updates. If either scheduled document fails, the
+requests from saving competing updates. If any scheduled document fails, the
 route returns a non-successful HTTP status so Scheduler can retry. Manual
 requests instead return per-area results that the Review screen can display.
+Home refreshes preserve every unfinished task exactly and replace only completed
+tasks, while Health and Meals generate a complete Sunday-through-Saturday plan.
+The runner passes its requested local date and Sunday week start into validation:
+Health `last_updated` must exactly equal that requested date, and Meals
+`week_starting` must exactly equal that requested week's Sunday.
+
+Home and Health entry-state changes use the PUT route above. Storage loads the
+current document revision and saves only when that revision still matches, so a
+concurrent refresh cannot be overwritten by an older browser action. Meals
+recommendations have no persisted entry ids and remain session-only in the
+browser.
+
+Prompt GET and PUT requests can be canceled when the editor closes, a newer
+request starts, or the page unmounts. The Edit Prompt control is disabled during
+any Home, Health, or Meals refresh so a sequential bulk refresh cannot observe a
+prompt that changed halfway through the run. A `skipped` update result means no
+new revision was saved: the interface keeps the honest skipped message and
+performs a bounded, delayed snapshot reconciliation to discover another request's
+completed save without claiming that the current request succeeded.
 
 ## Verification
 
@@ -286,19 +315,24 @@ content.
 ## Data and secrets
 
 Manual and scheduled refreshes send the selected document and its stored prompt
-to OpenRouter. The current Health and Meals targets do not request Zero Data
-Retention, so do not store data in those documents that you are not comfortable
-sharing with the configured provider. Generated responses must remain valid JSON
-with the same object keys and value types as the original; array lengths may
-change.
+to OpenRouter. Home, Health, and Meals are non-ZDR targets, so do not store data
+in those documents that you are not comfortable sharing with the configured
+provider. Each content type has its own response schema: Home uses a maintenance
+task document, Health uses a workout document, and Meals uses a recommendation
+document. After decoding, the backend performs local semantic validation for
+that content type before saving; there is no universal same-shape rule. The
+validators still enforce the preservation rules that matter for each document,
+including keeping unfinished Home tasks unchanged.
 
 `.env.local` files are ignored by Git. Keep database credentials, API keys, and
 other machine-specific secrets out of committed files.
 
 ## Current limitations
 
-- Marking an entry done changes React state only and resets on reload.
-- Only Health and Meals have model-driven update targets.
+- Meals entry state changes are browser-session-only and reset on reload; Home
+  and Health state changes are persisted by the entry-state endpoint.
+- Reading is retired and ignored; Home, Health, and Meals are the model-driven
+  update targets.
 - Database migrations and seed data are intentionally deferred; deployment
   currently requires the existing configured Supabase database.
 - Cloud Run and Scheduler resources are configured in the Google Cloud Console;

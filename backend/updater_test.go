@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -89,6 +90,7 @@ func TestBuildCalendarUpdatePromptAddsCurrentWeek(t *testing.T) {
 
 	prompt, err := buildCalendarUpdatePrompt(
 		"Refresh the meals for the supplied target week.",
+		weeklyMealRecommendationsContentType,
 		now,
 	)
 	if err != nil {
@@ -108,9 +110,47 @@ func TestBuildCalendarUpdatePromptAddsCurrentWeek(t *testing.T) {
 func TestBuildCalendarUpdatePromptRejectsBlankStoredPrompt(t *testing.T) {
 	t.Parallel()
 
-	_, err := buildCalendarUpdatePrompt("   ", time.Now())
+	_, err := buildCalendarUpdatePrompt("   ", maintenanceTasksContentType, time.Now())
 	if err == nil {
 		t.Fatal("buildCalendarUpdatePrompt() returned nil, expected an error")
+	}
+}
+
+func TestBuildCalendarUpdatePromptUsesQueueRulesForHome(t *testing.T) {
+	t.Parallel()
+
+	prompt, err := buildCalendarUpdatePrompt(
+		"Refresh the household task queue.",
+		maintenanceTasksContentType,
+		time.Date(2026, time.July, 24, 10, 0, 0, 0, time.UTC),
+	)
+	if err != nil {
+		t.Fatalf("buildCalendarUpdatePrompt() returned an unexpected error: %v", err)
+	}
+	if !strings.Contains(prompt, "preserve every task whose state is open exactly") {
+		t.Fatalf("Home prompt omitted the preserve-open instruction: %q", prompt)
+	}
+	if !strings.Contains(prompt, "Replace only tasks whose state is done") {
+		t.Fatalf("Home prompt omitted the replace-done instruction: %q", prompt)
+	}
+	if strings.Contains(prompt, "Generate the complete plan for Sunday through Saturday") {
+		t.Fatalf("Home prompt retained the conflicting calendar-plan instruction: %q", prompt)
+	}
+}
+
+func TestWeeklyAreaUpdateTargetsIncludeHomeInStableOrder(t *testing.T) {
+	t.Parallel()
+
+	// This list drives the section endpoint, the manual update-all action, and
+	// the scheduler whenever a runner has no test-specific targets. Keep the
+	// assertion exact so a future target does not accidentally reorder Home.
+	want := []areaUpdateTarget{
+		{AreaID: "home", ContentType: maintenanceTasksContentType, ZDR: false},
+		{AreaID: "health", ContentType: weeklyWorkoutRoutineContentType, ZDR: false},
+		{AreaID: "meals", ContentType: weeklyMealRecommendationsContentType, ZDR: false},
+	}
+	if !reflect.DeepEqual(weeklyAreaUpdateTargets, want) {
+		t.Fatalf("weeklyAreaUpdateTargets = %#v, want %#v", weeklyAreaUpdateTargets, want)
 	}
 }
 
@@ -174,6 +214,183 @@ func TestUpdateTargetSkipsModelWhileAnotherUpdateHoldsLock(t *testing.T) {
 	}
 	if promptQueries := overlapState.promptQueryCount(); promptQueries != 0 {
 		t.Fatalf("updateTarget() made %d prompt queries, want 0 before model generation", promptQueries)
+	}
+}
+
+func TestUpdateTargetRejectsWrongWeekMealsBeforeSave(t *testing.T) {
+	t.Parallel()
+
+	// This fixture has every required Meals field and starts on a Sunday, but it
+	// belongs to the previous planning week. The runner's generatedJSON seam
+	// replaces only OpenRouter for this test; updateTarget still executes its
+	// real lock, prompt, validation, and storage-control flow.
+	_, wrongWeekMealsJSON := structuredWeeklyPlanJSONs("2026-07-24", "2026-07-12")
+	state := newValidationGateDatabaseState()
+	database := sql.OpenDB(validationGateConnector{state: state})
+	database.SetMaxOpenConns(4)
+	t.Cleanup(func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("close validation-gate database: %v", err)
+		}
+	})
+
+	runner := areaUpdateRunner{
+		db: database,
+		generateJSON: func(
+			context.Context,
+			string,
+			string,
+			string,
+			time.Time,
+			bool,
+		) (string, error) {
+			return wrongWeekMealsJSON, nil
+		},
+	}
+	now := time.Date(2026, time.July, 24, 10, 0, 0, 0, time.UTC)
+	result := runner.updateTarget(
+		context.Background(),
+		now,
+		true,
+		areaUpdateTarget{
+			AreaID:      "meals",
+			ContentType: weeklyMealRecommendationsContentType,
+		},
+	)
+
+	if result.Status != areaUpdateStatusFailed {
+		t.Fatalf("updateTarget() status = %q, want failed", result.Status)
+	}
+	if result.Error == nil || !strings.Contains(result.Error.Error(), "must equal target week 2026-07-19") {
+		t.Fatalf("updateTarget() error = %v, want wrong-week validation failure", result.Error)
+	}
+	if saveAttempts := state.saveAttemptCount(); saveAttempts != 0 {
+		t.Fatalf("updateTarget() attempted %d saves, want 0 after wrong-week validation", saveAttempts)
+	}
+}
+
+// validationGateDatabaseState supplies the normal database reads and advisory
+// lock used by updateTarget. It counts UPDATE attempts so the test above proves
+// a syntactically valid but wrong-week model response cannot reach storage.
+type validationGateDatabaseState struct {
+	mu sync.Mutex
+
+	lockHeld     bool
+	saveAttempts int
+}
+
+func newValidationGateDatabaseState() *validationGateDatabaseState {
+	return &validationGateDatabaseState{}
+}
+
+func (state *validationGateDatabaseState) saveAttemptCount() int {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return state.saveAttempts
+}
+
+// validationGateConnector creates test connections that share the same lock
+// and save counter, mirroring the separate PostgreSQL sessions used by the
+// runner's advisory-lock connection and ordinary storage queries.
+type validationGateConnector struct {
+	state *validationGateDatabaseState
+}
+
+func (connector validationGateConnector) Connect(context.Context) (driver.Conn, error) {
+	return &validationGateConnection{state: connector.state}, nil
+}
+
+func (connector validationGateConnector) Driver() driver.Driver {
+	return validationGateDriver{state: connector.state}
+}
+
+type validationGateDriver struct {
+	state *validationGateDatabaseState
+}
+
+func (testDriver validationGateDriver) Open(string) (driver.Conn, error) {
+	return &validationGateConnection{state: testDriver.state}, nil
+}
+
+// validationGateConnection recognizes exactly the operations in this update
+// path. Treating a save as an explicit operation makes an accidental bypass of
+// the validation boundary visible even before the final assertion runs.
+type validationGateConnection struct {
+	state     *validationGateDatabaseState
+	holdsLock bool
+}
+
+func (connection *validationGateConnection) Prepare(string) (driver.Stmt, error) {
+	return nil, errors.New("prepared statements are not supported by the validation-gate test driver")
+}
+
+func (connection *validationGateConnection) Close() error {
+	connection.state.mu.Lock()
+	defer connection.state.mu.Unlock()
+
+	if connection.holdsLock {
+		connection.state.lockHeld = false
+		connection.holdsLock = false
+	}
+	return nil
+}
+
+func (connection *validationGateConnection) Begin() (driver.Tx, error) {
+	return nil, errors.New("transactions are not supported by the validation-gate test driver")
+}
+
+func (connection *validationGateConnection) QueryContext(
+	_ context.Context,
+	query string,
+	_ []driver.NamedValue,
+) (driver.Rows, error) {
+	switch {
+	case strings.Contains(query, "pg_try_advisory_lock"):
+		connection.state.mu.Lock()
+		acquired := !connection.state.lockHeld
+		if acquired {
+			connection.state.lockHeld = true
+			connection.holdsLock = true
+		}
+		connection.state.mu.Unlock()
+		return newSingleTestRow([]string{"acquired"}, acquired), nil
+
+	case strings.Contains(query, "pg_advisory_unlock"):
+		connection.state.mu.Lock()
+		released := connection.holdsLock && connection.state.lockHeld
+		if released {
+			connection.state.lockHeld = false
+			connection.holdsLock = false
+		}
+		connection.state.mu.Unlock()
+		return newSingleTestRow([]string{"released"}, released), nil
+
+	case strings.Contains(query, "FROM personal_ai.area_content"):
+		return newSingleTestRow(
+			[]string{"area_id", "content_type", "content", "revision", "updated_at"},
+			"meals",
+			weeklyMealRecommendationsContentType,
+			`{"week_starting":"2026-07-12","recommendations":[]}`,
+			int64(1),
+			time.Date(2026, time.July, 18, 12, 0, 0, 0, time.UTC),
+		), nil
+
+	case strings.Contains(query, "FROM personal_ai.area_update_prompt"):
+		return newSingleTestRow(
+			[]string{"area_id", "content_type", "prompt"},
+			"meals",
+			weeklyMealRecommendationsContentType,
+			"Generate this week's practical meals.",
+		), nil
+
+	case strings.Contains(query, "UPDATE personal_ai.area_content"):
+		connection.state.mu.Lock()
+		connection.state.saveAttempts++
+		connection.state.mu.Unlock()
+		return nil, errors.New("wrong-week content unexpectedly reached storage")
+
+	default:
+		return nil, fmt.Errorf("validation-gate test driver received an unexpected query: %s", query)
 	}
 }
 

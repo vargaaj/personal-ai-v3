@@ -2,7 +2,7 @@
 
 ## Product thesis
 
-This is a private operating surface for one person who needs to notice, decide, and move on. The first screen is **Review**: a live queue assembled from recurring areas such as health, meals, reading, home, money, and mail. The interface should feel closer to a well-kept field instrument than a business dashboard—quiet until something needs attention, precise when it does.
+This is a private operating surface for one person who needs to notice, decide, and move on. The first screen is **Review**: a live queue assembled from the database-backed Home, Health, and Meals areas, with fixture-only legacy examples such as Mail and Money used during design work. Reading is retired and ignored, so it is not a current navigation stop. The interface should feel closer to a well-kept field instrument than a business dashboard—quiet until something needs attention, precise when it does.
 
 User-facing language describes recognizable areas and actions. “Loop” remains an implementation-neutral concept where useful, but it is not the product's default noun. The main vocabulary is **Review**, **Areas**, **Entries**, **Open**, and **Done**.
 
@@ -68,8 +68,8 @@ Efficient on a large monitor, but too close to an admin console and too fragile 
 ┌ quiet area nav ┐ ┌ date + review controls ─────────────┐
 │ Review         │ │ ┃ Mail · 3                           │
 │ Health         │ │ ┣━ actionable entries               │
-│ Meals          │ │ ┃ Home · 2                           │
-│ Reading        │ │ ┣━ actionable entries               │
+│ Home           │ │ ┃ Home · 2                           │
+│ Meals          │ │ ┣━ actionable entries               │
 │ …              │ │ ┗━ clear stopping point             │
 └────────────────┘ └──────────────────────────────────────┘
 ```
@@ -90,7 +90,7 @@ Empty states give a next action (“Nothing needs review. Show done entries”) 
 
 The first instinct—an almanac-like cream canvas with serif headings—fit recurring personal rituals but landed too close to a common editorial-dashboard pattern. The direction was revised to a cool mineral palette, an accessibility-oriented sans for working text, and the functional cadence rail as the single aesthetic risk. Literata remains only as a small reflective accent.
 
-This fits the app because recurrence is represented as cadence, not as KPI cards or productivity gamification. The rail answers “where does my attention move next,” while the uninterrupted reading canvas handles genuinely long health routines, news summaries, and mail context. There is no hero, metric-card grid, ornamental chart, or business-facing sidebar taxonomy. The result should feel personal and composed without making routine maintenance theatrical.
+This fits the app because recurrence is represented as cadence, not as KPI cards or productivity gamification. The rail answers “where does my attention move next,” while the uninterrupted reading canvas handles genuinely long health routines, meal plans, and fixture-only mail context. There is no hero, metric-card grid, ornamental chart, or business-facing sidebar taxonomy. The result should feel personal and composed without making routine maintenance theatrical.
 
 ## Quality floor
 
