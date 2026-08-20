@@ -37,12 +37,13 @@ type chatResponse struct {
 }
 
 // sendChatMessage sends one JSON update request. zdr identifies whether this
-// particular system must use a Zero Data Retention provider endpoint. Health
-// and Meals pass false; a future Email updater will pass true.
+// particular system must use a Zero Data Retention provider endpoint. Home,
+// Health, and Meals pass false; a future Email updater will pass true.
 func sendChatMessage(
 	ctx context.Context,
 	prompt string,
 	currentJSON string,
+	contentType string,
 	zdr bool,
 ) (chatResponse, error) {
 	prompt = strings.TrimSpace(prompt)
@@ -53,6 +54,11 @@ func sendChatMessage(
 	currentJSON = strings.TrimSpace(currentJSON)
 	if currentJSON == "" {
 		return chatResponse{}, errors.New("json is required")
+	}
+
+	contentType = strings.TrimSpace(contentType)
+	if contentType == "" {
+		return chatResponse{}, errors.New("content type is required")
 	}
 
 	apiKey := os.Getenv("OPENROUTER_API_KEY")
@@ -66,7 +72,7 @@ func sendChatMessage(
 
 	// Model and privacy selection live in a pure helper so tests can inspect the
 	// outgoing request without an API key or a live OpenRouter call.
-	chatRequest := buildChatRequest(prompt, currentJSON, zdr)
+	chatRequest := buildChatRequest(prompt, currentJSON, contentType, zdr)
 
 	response, err := client.Chat.Send(
 		ctx,
@@ -105,9 +111,14 @@ func sendChatMessage(
 //
 // When zdr is true, Model contains only Ling and Provider requires both no data
 // collection and zero retention. When zdr is false, Models contains the ordered
-// free fallback list and Provider is omitted, so this request adds no privacy
-// restrictions beyond settings configured on the OpenRouter account itself.
-func buildChatRequest(prompt string, currentJSON string, zdr bool) components.ChatRequest {
+// free fallback list. Documents with a response format set require_parameters
+// so an OpenRouter provider cannot silently ignore their JSON Schema.
+func buildChatRequest(
+	prompt string,
+	currentJSON string,
+	contentType string,
+	zdr bool,
+) components.ChatRequest {
 	request := components.ChatRequest{
 		Messages: []components.ChatMessages{
 			components.CreateChatMessagesUser(
@@ -121,21 +132,46 @@ func buildChatRequest(prompt string, currentJSON string, zdr bool) components.Ch
 		},
 	}
 
+	// Provider preferences are assembled once so schema support and privacy can
+	// coexist. Structured documents need require_parameters because otherwise an
+	// OpenRouter provider may silently ignore response_format. A future private
+	// structured document can carry both this requirement and the ZDR restrictions
+	// below.
+	providerPreferences := components.ProviderPreferences{}
+	hasProviderPreferences := false
+
+	// Each document owns its complete response schema. Home intentionally differs
+	// from the weekly plans: its schema describes a full document in which open
+	// tasks are copied and only completed task positions receive replacements.
+	responseFormat, hasResponseFormat := responseFormatForContentType(contentType)
+	if hasResponseFormat {
+		request.ResponseFormat = &responseFormat
+		providerPreferences.RequireParameters = optionalnullable.From(
+			openrouter.Pointer(true),
+		)
+		hasProviderPreferences = true
+	}
+
 	if zdr {
 		// A single explicit model avoids randomly selecting a free model for
 		// sensitive content. The policy ensures that even Ling is rejected if its
 		// currently available endpoint does not meet both privacy requirements.
 		request.Model = openrouter.Pointer(privateZDRModel)
-		request.Provider = optionalnullable.From(openrouter.Pointer(components.ProviderPreferences{
-			DataCollection: optionalnullable.From(openrouter.Pointer(components.DataCollectionDeny)),
-			Zdr:            optionalnullable.From(openrouter.Pointer(true)),
-		}))
-		return request
+		providerPreferences.DataCollection = optionalnullable.From(
+			openrouter.Pointer(components.DataCollectionDeny),
+		)
+		providerPreferences.Zdr = optionalnullable.From(openrouter.Pointer(true))
+		hasProviderPreferences = true
+	} else {
+		// Copy the slice so the SDK cannot mutate the package-level configuration
+		// used to build later requests.
+		request.Models = append([]string(nil), generalFreeModels...)
 	}
 
-	// Copy the slice so the SDK cannot mutate the package-level configuration
-	// used to build later requests.
-	request.Models = append([]string(nil), generalFreeModels...)
+	if hasProviderPreferences {
+		request.Provider = optionalnullable.From(openrouter.Pointer(providerPreferences))
+	}
+
 	return request
 }
 

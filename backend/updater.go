@@ -16,12 +16,13 @@ import (
 //
 // The lower-level updateJSON function sends one document to OpenRouter and
 // validates the response. areaUpdateRunner coordinates storage around that call:
-// it checks whether Health or Meals is due, loads the prompt only when it will
-// actually be used, supplies calendar context, and saves with revision checking.
+// it checks whether Home, Health, or Meals is due, loads the prompt only when
+// it will actually be used, supplies calendar context, and saves with revision
+// checking.
 //
 // A scheduled or manual refresh follows this sequence:
 //
-//  1. run chooses the Health and Meals documents.
+//  1. run chooses the Home, Health, and Meals documents.
 //  2. updateTarget loads the current JSON for one document.
 //  3. A scheduled run stops there when that document was already updated this
 //     week. This is why its prompt is not fetched during ordinary due checks.
@@ -32,7 +33,9 @@ import (
 //     saved a newer revision between the first read and the lock attempt, this
 //     request also stops without calling the model a second time.
 //  6. The runner loads the matching database prompt.
-//  7. buildCalendarUpdatePrompt adds this week's actual dates to that prompt.
+//  7. buildCalendarUpdatePrompt adds the weekly context appropriate for that
+//     document: queue replacement rules for Home and calendar-plan rules for
+//     Health and Meals.
 //  8. updateJSON asks OpenRouter for replacement JSON and validates its shape.
 //  9. saveAreaContent stores it only if another writer has not already changed
 //     the document's revision.
@@ -44,16 +47,21 @@ type areaUpdateTarget struct {
 	AreaID      string
 	ContentType string
 
-	// ZDR is true only when this document must use Zero Data Retention. Health
-	// and Meals are false; a future Email target will set this field to true.
+	// ZDR is true only when this document must use Zero Data Retention. Home,
+	// Health, and Meals are false; a future Email target will set this field to
+	// true.
 	ZDR bool
 }
 
-// weeklyAreaUpdateTargets is the deliberately small initial schedule. Home and
-// Reading remain untouched until their refresh cadence and prompts are defined.
+// weeklyAreaUpdateTargets is the explicit, stable order for every bulk and
+// scheduled weekly refresh. Home comes first because its completed maintenance
+// tasks are replaced before the Health workout and Meals plan are regenerated.
+// Reading remains outside this weekly cadence until it has its own prompt and
+// refresh policy.
 var weeklyAreaUpdateTargets = []areaUpdateTarget{
-	{AreaID: "health", ContentType: "weekly_workout_routine", ZDR: false},
-	{AreaID: "meals", ContentType: "weekly_meal_recommendations", ZDR: false},
+	{AreaID: "home", ContentType: maintenanceTasksContentType, ZDR: false},
+	{AreaID: "health", ContentType: weeklyWorkoutRoutineContentType, ZDR: false},
+	{AreaID: "meals", ContentType: weeklyMealRecommendationsContentType, ZDR: false},
 }
 
 // errAreaUpdateTargetNotConfigured lets the HTTP layer distinguish an unknown
@@ -93,7 +101,10 @@ type AreaUpdateResult struct {
 
 // areaUpdateRunner holds the concrete Supabase pool used by the update workflow.
 // updateTarget calls the named storage and model functions directly, avoiding
-// function-type fields that can hide which implementation performs each step.
+// broad dependency interfaces that can hide which implementation performs each
+// step. generateJSON is the narrow exception used by updater_test.go: it lets a
+// test supply untrusted model text and prove validation blocks storage without
+// making a live OpenRouter request. Production leaves it nil and uses updateJSON.
 type areaUpdateRunner struct {
 	// db is the same database pool used by the HTTP server.
 	db *sql.DB
@@ -101,6 +112,12 @@ type areaUpdateRunner struct {
 	// targets identifies the documents this runner should update. Production
 	// leaves it empty to use weeklyAreaUpdateTargets.
 	targets []areaUpdateTarget
+
+	// generateJSON returns raw model JSON for one target. It is intentionally
+	// optional so the production path remains the concrete updateJSON function;
+	// the runner, rather than a test double, always owns the validation-before-save
+	// boundary below.
+	generateJSON func(context.Context, string, string, string, time.Time, bool) (string, error)
 }
 
 // areaUpdateLock owns the one database session that holds a PostgreSQL advisory
@@ -228,7 +245,7 @@ func (lock *areaUpdateLock) release() error {
 // run refreshes every configured target independently. Scheduled calls pass
 // force=false so documents already updated during the current Sunday-Saturday week
 // are skipped before their prompts are loaded. The manual button will pass
-// force=true so a person can intentionally regenerate both sections at any time.
+// force=true so a person can intentionally regenerate all sections at any time.
 //
 // `(runner areaUpdateRunner)` is the method receiver. It means run belongs to an
 // areaUpdateRunner value, is called as `runner.run(...)`, and can read the
@@ -259,7 +276,7 @@ func (runner areaUpdateRunner) run(ctx context.Context, now time.Time, force boo
 	targets := runner.targets
 
 	// An empty target list means "use the application's normal weekly sections,"
-	// currently Health and Meals.
+	// currently Home, Health, and Meals in weeklyAreaUpdateTargets order.
 	if len(targets) == 0 {
 		targets = weeklyAreaUpdateTargets
 	}
@@ -268,8 +285,8 @@ func (runner areaUpdateRunner) run(ctx context.Context, now time.Time, force boo
 	// starts at zero because append below adds each completed outcome.
 	results := make([]AreaUpdateResult, 0, len(targets))
 
-	// Process Health and Meals one at a time. Sequential model calls avoid sending
-	// multiple potentially large personal JSON requests at once.
+	// Process Home, Health, and Meals one at a time. Sequential model calls avoid
+	// sending multiple potentially large personal JSON requests at once.
 	for _, target := range targets {
 		// A canceled HTTP request or server shutdown should stop before another
 		// potentially slow model request begins.
@@ -291,7 +308,8 @@ func (runner areaUpdateRunner) run(ctx context.Context, now time.Time, force boo
 
 // runOne updates exactly one configured AreaContent document.
 //
-// The individual Health and Meals buttons call this method with force=true.
+// The individual Home, Health, and Meals buttons call this method with
+// force=true.
 // Looking up the target in weeklyAreaUpdateTargets is important: a browser
 // cannot invent an arbitrary area id, content type, or privacy setting and cause
 // the server to send that unconfigured document to OpenRouter.
@@ -319,7 +337,7 @@ func (runner areaUpdateRunner) runOne(
 	}
 
 	// Tests may provide a smaller target list. Production leaves runner.targets
-	// empty and therefore uses the normal Health and Meals configuration.
+	// empty and therefore uses the normal Home, Health, and Meals configuration.
 	targets := runner.targets
 	if len(targets) == 0 {
 		targets = weeklyAreaUpdateTargets
@@ -352,8 +370,9 @@ func (runner areaUpdateRunner) runOne(
 }
 
 // updateTarget performs one complete load, generate, and save operation. Errors
-// become a failed result instead of stopping the other weekly target; a Health
-// provider failure should not prevent Meals from receiving its own update.
+// become a failed result instead of stopping the other weekly targets; a model
+// failure for one Home, Health, or Meals document must not prevent the other
+// independent documents from receiving their updates.
 func (runner areaUpdateRunner) updateTarget(
 	ctx context.Context,
 	now time.Time,
@@ -470,23 +489,46 @@ func (runner areaUpdateRunner) updateTarget(
 		return result
 	}
 
-	promptWithCalendar, err := buildCalendarUpdatePrompt(updatePrompt.Prompt, now)
+	// Home is a replacement queue rather than a calendar plan, so the helper
+	// receives the content type and adds instructions that match this target.
+	promptWithCalendar, err := buildCalendarUpdatePrompt(
+		updatePrompt.Prompt,
+		target.ContentType,
+		now,
+	)
 	if err != nil {
 		result.Error = fmt.Errorf("prepare %s/%s update prompt: %w", target.AreaID, target.ContentType, err)
 		return result
 	}
 
-	// Carry this target's privacy requirement into the model request. Health and
-	// Meals use the general free-model fallbacks; a future Email target can use
-	// Ling with strict ZDR without changing this orchestration.
-	updatedJSON, err := updateJSON(
+	// Carry this target's privacy requirement into the model request. Home,
+	// Health, and Meals use the general free-model fallbacks; a future Email
+	// target can use Ling with strict ZDR without changing this orchestration.
+	// Tests may supply raw generated text, but validation remains in this runner
+	// so every result follows the same trusted-before-storage path.
+	generateJSON := runner.generateJSON
+	if generateJSON == nil {
+		generateJSON = updateJSON
+	}
+	updatedJSON, err := generateJSON(
 		ctx,
 		promptWithCalendar,
 		string(current.Content),
+		target.ContentType,
+		now,
 		target.ZDR,
 	)
 	if err != nil {
 		result.Error = fmt.Errorf("generate %s/%s content: %w", target.AreaID, target.ContentType, err)
+		return result
+	}
+
+	// The model response is untrusted even when its provider accepted a JSON
+	// Schema. Validate it after generation and immediately before storage, using
+	// this runner's supplied local time so stale Health or Meals dates cannot
+	// reach Supabase. Home and generic content retain their existing validators.
+	if err := validateGeneratedJSON(target.ContentType, string(current.Content), updatedJSON, now); err != nil {
+		result.Error = fmt.Errorf("validate %s/%s generated content: %w", target.AreaID, target.ContentType, err)
 		return result
 	}
 
@@ -514,9 +556,10 @@ func weeklyAreaUpdateDue(updatedAt time.Time, now time.Time) bool {
 }
 
 // startOfSundayWeek returns midnight Sunday in now's location. The due check
-// uses this boundary to decide whether the stored Health or Meals document came
-// from the current Sunday-Saturday planning week. main.go supplies New York
-// time, so the boundary follows the application's local calendar.
+// uses this boundary to decide whether the stored Home, Health, or Meals
+// document came from the current Sunday-Saturday planning week. main.go
+// supplies New York time, so the boundary follows the application's local
+// calendar.
 func startOfSundayWeek(now time.Time) time.Time {
 	// Go numbers Sunday as weekday zero, Monday as one, and so on. Converting the
 	// weekday directly to an integer therefore also gives the number of calendar
@@ -529,30 +572,46 @@ func startOfSundayWeek(now time.Time) time.Time {
 	return todayAtMidnight.AddDate(0, 0, -daysSinceSunday)
 }
 
-// buildCalendarUpdatePrompt adds changing dates to stable database instructions.
-// Prompt rows can therefore describe Health or Meals behavior without being
-// edited every week just to replace a date.
-func buildCalendarUpdatePrompt(storedPrompt string, now time.Time) (string, error) {
+// buildCalendarUpdatePrompt adds changing dates and target-specific weekly
+// instructions to stable database prompts. Home has a task queue, not a
+// Sunday-through-Saturday plan: its open tasks must remain untouched while only
+// completed positions are replaced. Health and Meals retain the plan language.
+func buildCalendarUpdatePrompt(
+	storedPrompt string,
+	contentType string,
+	now time.Time,
+) (string, error) {
 	storedPrompt = strings.TrimSpace(storedPrompt)
 	if storedPrompt == "" {
 		return "", errors.New("stored update prompt is required")
 	}
 
 	weekStart := startOfSundayWeek(now)
-	return storedPrompt +
+	context := storedPrompt +
 		"\n\nScheduling context:\n" +
 		"Current date: " + now.Format("2006-01-02") + "\n" +
-		"Target week starts Sunday: " + weekStart.Format("2006-01-02") + "\n" +
+		"Target week starts Sunday: " + weekStart.Format("2006-01-02") + "\n"
+
+	if strings.TrimSpace(contentType) == maintenanceTasksContentType {
+		return context +
+			"Weekly Home queue: preserve every task whose state is open exactly as " +
+			"supplied. Replace only tasks whose state is done, keeping the same " +
+			"entry count and order. Each replacement must be a new unfinished open task.", nil
+	}
+
+	return context +
 		"Generate the complete plan for Sunday through Saturday, including the starting Sunday.", nil
 }
 
 // updateJSON sends one JSON document to the LLM with instructions for how to
-// change it. The returned string is still JSON text because the next storage
-// step will save that text back to a file.
+// change it. The returned string is still JSON text because updateTarget then
+// validates the same result immediately before it can be saved.
 func updateJSON(
 	ctx context.Context,
 	prompt string,
 	originalJSON string,
+	contentType string,
+	now time.Time,
 	zdr bool,
 ) (string, error) {
 	// Trim user-provided inputs at the boundary so the rest of the function can
@@ -570,6 +629,15 @@ func updateJSON(
 		return "", errors.New("original json is not valid")
 	}
 
+	// The content type selects the response contract at the OpenRouter boundary.
+	// Home, Health, and Meals each receive their own JSON Schema. Other
+	// future update targets can continue through the generic same-shape path until
+	// they also define a document-specific contract.
+	contentType = strings.TrimSpace(contentType)
+	if contentType == "" {
+		return "", errors.New("content type is required")
+	}
+
 	// A nil context is allowed for simple local calls. Converting it to
 	// context.Background keeps sendChatMessage from receiving a nil context.
 	if ctx == nil {
@@ -579,15 +647,23 @@ func updateJSON(
 	// sendChatMessageWithRetry builds the final chat request and calls
 	// OpenRouter. It retries short-lived network or model-response timeouts
 	// before returning an error to main.go.
-	chat, err := sendChatMessageWithRetry(ctx, prompt, originalJSON, zdr)
+	chat, err := sendChatMessageWithRetry(
+		ctx,
+		prompt,
+		originalJSON,
+		contentType,
+		zdr,
+	)
 	if err != nil {
 		return "", err
 	}
 
-	// The LLM response is treated as untrusted text until it parses as JSON and
-	// passes the same-shape check against the original document.
+	// Validate the provider response before returning it. updateTarget repeats
+	// this check immediately before storage, which preserves the same safety for
+	// its narrow test generator while this direct model boundary rejects malformed
+	// output for ordinary production calls.
 	updatedJSON := strings.TrimSpace(chat.Response)
-	err = validateJSONStructure(originalJSON, updatedJSON)
+	err = validateGeneratedJSON(contentType, originalJSON, updatedJSON, now)
 	if err != nil {
 		return "", err
 	}
@@ -603,6 +679,7 @@ func sendChatMessageWithRetry(
 	ctx context.Context,
 	prompt string,
 	originalJSON string,
+	contentType string,
 	zdr bool,
 ) (chatResponse, error) {
 	// Keep the retry count small so the command does not hang for a long time.
@@ -622,7 +699,13 @@ func sendChatMessageWithRetry(
 
 		// sendChatMessage makes the actual OpenRouter request. A successful call
 		// returns the model name and JSON text response.
-		chat, err := sendChatMessage(ctx, prompt, originalJSON, zdr)
+		chat, err := sendChatMessage(
+			ctx,
+			prompt,
+			originalJSON,
+			contentType,
+			zdr,
+		)
 		if err == nil {
 			fmt.Println("Model used:", chat.Model)
 			return chat, nil
@@ -689,187 +772,4 @@ func isRetryableChatError(err error) bool {
 	}
 
 	return false
-}
-
-// validateJSONStructure checks that the LLM returned valid JSON with the same
-// broad schema as the original document. It allows values to change, and arrays
-// may grow or shrink, but object keys and value types must stay consistent.
-func validateJSONStructure(originalJSON string, updatedJSON string) error {
-	// Unmarshal means "parse JSON bytes into a Go value." Because originalValue is
-	// type any, the JSON package uses generic Go containers: objects become
-	// map[string]any, arrays become []any, and numbers become float64.
-	var originalValue any
-	err := json.Unmarshal([]byte(strings.TrimSpace(originalJSON)), &originalValue)
-	if err != nil {
-		return fmt.Errorf("parse original json: %w", err)
-	}
-
-	// Parse the model's response the same way so the two generic JSON trees can
-	// be compared without needing a custom Go struct for each JSON file type.
-	var updatedValue any
-	err = json.Unmarshal([]byte(strings.TrimSpace(updatedJSON)), &updatedValue)
-	if err != nil {
-		return fmt.Errorf("parse updated json: %w", err)
-	}
-
-	return compareJSONStructure("$", originalValue, updatedValue)
-}
-
-// jsonKind gives validation errors readable type names instead of Go's
-// reflection-heavy wording. For example, callers see "changed from object to
-// string" when the model replaces a JSON object with plain text.
-func jsonKind(value any) string {
-	switch value.(type) {
-	case map[string]any:
-		return "object"
-	case []any:
-		return "array"
-	case string:
-		return "string"
-	case float64:
-		return "number"
-	case bool:
-		return "boolean"
-	case nil:
-		return "null"
-	default:
-		return "unknown"
-	}
-}
-
-// compareJSONStructure walks both parsed JSON documents at the same time. The
-// path string records where a mismatch happened, such as
-// "$.week[2].exercises[0].sets".
-func compareJSONStructure(path string, original any, updated any) error {
-	// This switch looks at the original value first because the original JSON is
-	// the schema we trust. Each branch then checks whether the updated value is
-	// still the same kind of JSON value.
-	switch originalTyped := original.(type) {
-	case map[string]any:
-		// A JSON object was parsed as map[string]any. Delegate to the object
-		// helper so key-by-key validation stays separate from array validation.
-		return compareJSONObjectStructure(path, originalTyped, updated)
-	case []any:
-		// A JSON array was parsed as []any. Delegate to the array helper so item
-		// shape validation can allow added or removed entries.
-		return compareJSONArrayStructure(path, originalTyped, updated)
-	case string:
-		// Type assertion asks Go: "is updated also a string?" The blank identifier
-		// ignores the actual string value because only the type matters here.
-		_, ok := updated.(string)
-		if !ok {
-			return fmt.Errorf("%s changed from string to %s", path, jsonKind(updated))
-		}
-	case float64:
-		// The encoding/json package parses all generic JSON numbers as float64,
-		// so a number in the original document must still be a float64 here.
-		_, ok := updated.(float64)
-		if !ok {
-			return fmt.Errorf("%s changed from number to %s", path, jsonKind(updated))
-		}
-	case bool:
-		// Booleans represent JSON true/false values. The actual true/false value
-		// may change, but it must remain a boolean.
-		_, ok := updated.(bool)
-		if !ok {
-			return fmt.Errorf("%s changed from boolean to %s", path, jsonKind(updated))
-		}
-	case nil:
-		// JSON null parses as nil. If the original field was null, the updated
-		// field must also stay null for this generic structure check to pass.
-		if updated != nil {
-			return fmt.Errorf("%s changed from null to %s", path, jsonKind(updated))
-		}
-	}
-
-	return nil
-}
-
-// compareJSONObjectStructure checks a JSON object. Objects are the strictest
-// part of the validation because downstream code often depends on exact keys
-// like "day", "focus", and "exercises" being present after an LLM update.
-func compareJSONObjectStructure(path string, original map[string]any, updated any) error {
-	// Confirm the updated value is also a JSON object before checking individual
-	// keys. If it is not an object, there is no safe way to look up fields on it.
-	updatedObject, ok := updated.(map[string]any)
-	if !ok {
-		return fmt.Errorf("%s changed from object to %s", path, jsonKind(updated))
-	}
-
-	// A different number of keys means the LLM added or removed fields. This
-	// generic updater rejects that because callers expect the original schema to
-	// survive the update.
-	if len(original) != len(updatedObject) {
-		return fmt.Errorf("%s object keys changed", path)
-	}
-
-	// Walk every key from the original object. For each original key, this loop:
-	// 1. Looks for the same key in the updated object.
-	// 2. Fails immediately if the updated object is missing that key.
-	// 3. Recursively compares the original and updated values for that key.
-	// For example, if key is "week", the recursive call checks the structure of
-	// the updated "week" array.
-	for key, originalChild := range original {
-		// updatedChild is the value from the LLM output at the same object key.
-		// ok is false when the LLM removed or renamed that key.
-		updatedChild, ok := updatedObject[key]
-		if !ok {
-			return fmt.Errorf("%s.%s key is missing", path, key)
-		}
-
-		// Recurse into nested objects, arrays, or primitive values. The path adds
-		// ".key" so any error message points to the exact nested location.
-		err := compareJSONStructure(path+"."+key, originalChild, updatedChild)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-// compareJSONArrayStructure checks a JSON array. Arrays represent repeatable
-// data such as days, exercises, or loop items, so their length may change when
-// the prompt asks to add or remove entries. Each entry still needs to look like
-// the same kind of item.
-func compareJSONArrayStructure(path string, original []any, updated any) error {
-	// Confirm the updated value is also an array before walking its items.
-	// Without this check, code below would panic when treating it like []any.
-	updatedArray, ok := updated.([]any)
-	if !ok {
-		return fmt.Errorf("%s changed from array to %s", path, jsonKind(updated))
-	}
-
-	// If either side is empty, there is no item shape to compare. The array type
-	// itself was already checked above, so this is acceptable for a generic
-	// updater.
-	if len(original) == 0 || len(updatedArray) == 0 {
-		return nil
-	}
-
-	// Walk every item returned by the LLM. The loop uses the updated array length
-	// because newly added items also need validation before the JSON is saved.
-	for index, updatedChild := range updatedArray {
-		// By default, compare a new or extra updated item against the first
-		// original item. The first original item acts as the template for what one
-		// item in this array should look like.
-		originalChild := original[0]
-
-		// If the original array had an item at the same index, use that matching
-		// original item instead. This handles arrays where different positions
-		// have slightly different shapes.
-		if index < len(original) {
-			originalChild = original[index]
-		}
-
-		// Recurse into the selected original item and this updated item. The path
-		// adds "[index]" so an error can identify the exact array element that
-		// changed shape.
-		err := compareJSONStructure(fmt.Sprintf("%s[%d]", path, index), originalChild, updatedChild)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
 }

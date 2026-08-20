@@ -42,6 +42,19 @@
 //	  |         -> writeAreaContentsResponse(...)
 //	  |         -> JSON response consumed by fetchReviewAreas(...)
 //	  |
+//	  |       GET /api/areas/{areaID}/{contentType}/prompt
+//	  |       PUT /api/areas/{areaID}/{contentType}/prompt
+//	  |         -> loadAreaUpdatePrompt(...) or saveAreaUpdatePrompt(...)
+//	  |         -> Supabase area_update_prompt row for any stored area document
+//	  |         -> JSON response consumed by the prompt editor
+//	  |         -> does not regenerate the matching area_content document
+//	  |
+//	  |       PUT /api/areas/{areaID}/{contentType}/entries/{entryID}/state
+//	  |         -> saveAreaEntryState(...)
+//	  |         -> reads then conditionally saves one Home or Health entry state
+//	  |         -> preserves every other JSON field and leaves updated_at unchanged
+//	  |         -> JSON response consumed by the Review completion controls
+//	  |
 //	  |       POST /api/areas/weekly-update
 //	  |         -> serverApplication.updater.run(force=true)
 //	  |         -> same areaUpdateRunner/updateTarget path above
@@ -50,7 +63,7 @@
 //	  |         -> JSON results consumed by the frontend update button
 //	  |
 //	  |       POST /api/areas/{areaID}/{contentType}/update
-//	  |         -> called by one Health or Meals section button
+//	  |         -> called by one Home, Health, or Meals section button
 //	  |         -> serverApplication.updater.runOne(force=true, ...)
 //	  |         -> validates the pair against weeklyAreaUpdateTargets
 //	  |         -> runs the same updateTarget(...) path for only that document
@@ -60,7 +73,7 @@
 //	  |         -> called by Google Cloud Scheduler on Sunday morning
 //	  |         -> serverApplication.updater.run(force=false)
 //	  |         -> areaUpdateRunner.run(...)
-//	  |         -> updateTarget(...) once for Health and once for Meals
+//	  |         -> updateTarget(...) once for Home, Health, and Meals
 //	  |              |
 //	  |              +-- loadAreaContent(ctx, db, ...)
 //	  |              |     Reads the current JSON, revision, and updated_at.
@@ -325,7 +338,8 @@ func logAreaUpdateResults(trigger string, results []AreaUpdateResult) {
 
 // newHTTPHandler registers the application's routes. Each request calls a
 // concrete method or storage function: GET calls loadAreaContents with
-// application.db, and POST calls application.updater.run.
+// application.db, prompt and entry-state routes are composed by their focused
+// registrars, and POST calls application.updater.run.
 func (application *serverApplication) newHTTPHandler() http.Handler {
 	mux := http.NewServeMux()
 
@@ -337,7 +351,18 @@ func (application *serverApplication) newHTTPHandler() http.Handler {
 		writeAreaContentsResponse(w, contents, err)
 	})
 
-	// The Review screen's manual button calls this endpoint to regenerate both
+	// The extracted registrar keeps the prompt feature grouped in one file. Go's
+	// ServeMux resolves overlaps by pattern specificity, so its method-specific
+	// routes and prompt fallback retain precedence over the frontend catch-all.
+	registerAreaUpdatePromptRoutes(mux, application.db)
+
+	// Completion controls on Home maintenance tasks and Health workouts use a
+	// separate registrar because they mutate one entry inside a stored document.
+	// Its storage function reads the current revision before its conditional save,
+	// so this route cannot overwrite a concurrent weekly regeneration.
+	registerAreaEntryStateRoutes(mux, application.db)
+
+	// The Review screen's manual button calls this endpoint to regenerate all
 	// weekly documents immediately. Passing force=true bypasses the current-week
 	// skip, but the same prompts, model validation, and revision-safe save used by
 	// the scheduler still apply.
@@ -357,8 +382,8 @@ func (application *serverApplication) newHTTPHandler() http.Handler {
 		)
 	})
 
-	// A Health or Meals section button calls this route to regenerate only its
-	// own AreaContent document. Go's ServeMux places the two brace-delimited URL
+	// A Home, Health, or Meals section button calls this route to regenerate only
+	// its own AreaContent document. Go's ServeMux places the two brace-delimited URL
 	// segments into r.PathValue("areaID") and r.PathValue("contentType").
 	mux.HandleFunc("POST /api/areas/{areaID}/{contentType}/update", func(w http.ResponseWriter, r *http.Request) {
 		if application.updater == nil {
@@ -412,7 +437,8 @@ func (application *serverApplication) newHTTPHandler() http.Handler {
 	// When the production container supplies a React bundle, this final
 	// catch-all handles paths that were not claimed by the API routes above.
 	// Registering it without an HTTP method lets the handler return a true 404 for
-	// unsupported POST requests instead of ServeMux turning them into a 405.
+	// unsupported methods on unknown API paths. Known prompt paths have the more
+	// specific methodless fallback above and intentionally return 405 instead.
 	if application.frontendFiles != nil {
 		mux.Handle("/", newFrontendHandler(application.frontendFiles))
 	}
@@ -557,7 +583,7 @@ func writeAreaContentsResponse(w http.ResponseWriter, contents []AreaContent, er
 const (
 	// Manual requests use 207 so the browser's fetch remains successful and can
 	// read the safe per-area results. The Review screen then explains which of
-	// Health or Meals failed without receiving private provider diagnostics.
+	// Home, Health, or Meals failed without receiving private provider diagnostics.
 	manualAreaUpdateFailureHTTPStatus = http.StatusMultiStatus
 
 	// Scheduled requests use a non-2xx status because Cloud Scheduler considers

@@ -361,8 +361,8 @@
     line-height: 1.58;
   }
 
-  /* Weekly regeneration is intentionally grouped with session context instead
-     of queue filters: it changes the underlying Health and Meals documents,
+  /* Bulk refresh is intentionally grouped with session context instead
+     of queue filters: it changes the underlying Home, Health, and Meals documents,
      while Open/All/Done only changes which saved rows are visible. */
   .page-actions {
     flex: 0 0 264px;
@@ -716,14 +716,43 @@
     line-height: 1.45;
   }
 
-  /* Health and Meals each receive a quiet, accent-tinted action in their own
+  /* Home, Health, and Meals each receive quiet actions in their own
      heading. The darker page-header action remains the primary way to refresh
-     both plans; these controls communicate their narrower section scope. */
+     all three; these controls communicate their narrower section scope. */
   .area-update-actions {
     width: min(220px, 22vw);
     display: grid;
     justify-items: end;
     gap: 6px;
+  }
+
+  /* Prompt editing is a separate persistence action from refresh. This quiet
+     outlined control sits beside Refresh in every database-backed area, making
+     it clear that the text changes future generation instructions only. */
+  .area-prompt-button {
+    min-height: 44px;
+    padding: 0 11px;
+    border: 1px solid color-mix(in srgb, var(--area-accent) 28%, var(--line));
+    border-radius: 8px;
+    background: var(--porcelain);
+    color: var(--area-accent);
+    cursor: pointer;
+    font-size: 0.68rem;
+    font-weight: 620;
+    white-space: nowrap;
+    transition: border-color 150ms ease, background 150ms ease;
+  }
+
+  .area-prompt-button:hover:not(:disabled) {
+    border-color: color-mix(in srgb, var(--area-accent) 58%, var(--line));
+    background: color-mix(in srgb, var(--area-accent) 6%, var(--porcelain));
+  }
+
+  /* A content refresh may read prompts sequentially. Disabled styling makes it
+     clear that prompt edits will become available when that snapshot finishes. */
+  .area-prompt-button:disabled {
+    cursor: not-allowed;
+    opacity: 0.58;
   }
 
   .area-update-button {
@@ -779,8 +808,179 @@
     color: var(--area-accent);
   }
 
+  /* A skipped refresh is an honest neutral outcome: no new content was saved,
+     so it receives neither the success green nor the failure amber treatment. */
+  .area-update-message.is-skipped {
+    color: var(--muted);
+  }
+
   .area-update-message.is-error {
     color: #855f12;
+  }
+
+  /* ------------------------------------------------------------------------ */
+  /* Prompt editor modal                                                      */
+  /* ------------------------------------------------------------------------ */
+
+  /* The fixed backdrop sits above the responsive drawer and makes the modal's
+     boundary obvious. React adds `inert` to the surrounding app while this is
+     present; the translucent surface supplies the matching visual boundary. */
+  .prompt-dialog-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 40;
+    display: grid;
+    place-items: center;
+    padding: 24px;
+    background: rgba(24, 34, 31, 0.42);
+    backdrop-filter: blur(4px);
+  }
+
+  /* A constrained but roomy dialog gives long instructions a large editing
+     surface without overflowing short viewports. The inner form can scroll
+     independently, keeping Cancel and Save reachable on a small phone. */
+  .prompt-dialog {
+    width: min(100%, 760px);
+    max-height: min(820px, calc(100dvh - 48px));
+    overflow: auto;
+    padding: clamp(22px, 4vw, 34px);
+    border: 1px solid rgba(255, 255, 255, 0.54);
+    border-radius: 16px;
+    background: var(--porcelain);
+    box-shadow: 0 24px 70px rgba(10, 18, 15, 0.28);
+  }
+
+  .prompt-dialog-heading {
+    display: flex;
+    align-items: start;
+    justify-content: space-between;
+    gap: 18px;
+  }
+
+  .prompt-dialog-heading .eyebrow {
+    margin-bottom: 8px;
+  }
+
+  .prompt-dialog h2 {
+    margin: 0;
+    font-family: "Literata Variable", Georgia, serif;
+    font-size: clamp(1.55rem, 4vw, 2.1rem);
+    font-weight: 540;
+    letter-spacing: -0.035em;
+  }
+
+  .prompt-dialog-heading + p {
+    max-width: 68ch;
+    margin: 16px 0 22px;
+    color: var(--muted);
+    font-size: 0.84rem;
+    line-height: 1.55;
+  }
+
+  /* The close icon has a full touch target, while the visible Cancel button
+     below supplies a text alternative. Both use the same focusable close path. */
+  .prompt-dialog-close {
+    width: 44px;
+    height: 44px;
+    display: grid;
+    flex: 0 0 auto;
+    place-items: center;
+    padding: 0;
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    background: var(--porcelain);
+    color: var(--graphite);
+    cursor: pointer;
+  }
+
+  .prompt-textarea-label {
+    display: block;
+    margin-bottom: 8px;
+    color: var(--graphite);
+    font-size: 0.76rem;
+    font-weight: 650;
+  }
+
+  /* `resize: vertical` protects the layout while letting a desktop user grow
+     the text field. The minimum height ensures this is a genuine editor rather
+     than a one-line input, and the focus ring meets the shared keyboard style. */
+  .prompt-textarea {
+    box-sizing: border-box;
+    width: 100%;
+    min-height: 290px;
+    padding: 14px;
+    border: 1px solid #bdc9c1;
+    border-radius: 10px;
+    resize: vertical;
+    background: #fcfdfc;
+    color: var(--graphite);
+    font-family: "Public Sans Variable", system-ui, sans-serif;
+    font-size: 0.88rem;
+    line-height: 1.58;
+  }
+
+  .prompt-textarea:focus-visible {
+    outline: 2px solid var(--porcelain);
+    border-color: var(--iris);
+    box-shadow: 0 0 0 4px var(--iris);
+  }
+
+  .prompt-textarea:disabled {
+    cursor: wait;
+    background: #f1f4f1;
+  }
+
+  .prompt-dialog-message {
+    margin: 10px 0 0;
+    color: var(--muted);
+    font-size: 0.75rem;
+    line-height: 1.45;
+  }
+
+  .prompt-dialog-message.is-error {
+    color: #855f12;
+  }
+
+  .prompt-dialog-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+    margin-top: 20px;
+  }
+
+  .prompt-cancel-button,
+  .prompt-save-button {
+    min-height: 44px;
+    padding: 0 15px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 0.76rem;
+    font-weight: 650;
+  }
+
+  .prompt-cancel-button {
+    border: 1px solid var(--line);
+    background: var(--porcelain);
+    color: var(--graphite);
+  }
+
+  .prompt-save-button {
+    border: 1px solid var(--juniper);
+    background: var(--juniper);
+    color: white;
+  }
+
+  .prompt-save-button:disabled {
+    cursor: not-allowed;
+    opacity: 0.56;
+  }
+
+  /* Save remains a native tab stop while its PUT is pending. `aria-disabled`
+     announces the busy/unavailable state, while App.tsx's submit guard rejects
+     a second activation and the dialog focus loop still has one safe control. */
+  .prompt-save-button[aria-disabled="true"] {
+    cursor: wait;
+    opacity: 0.72;
   }
 
   /* ------------------------------------------------------------------------ */
@@ -848,9 +1048,17 @@
     transition: transform 150ms ease, background 150ms ease, border-color 150ms ease;
   }
 
-  .check-control:hover .check-dot {
+  .check-control:hover:not(:disabled) .check-dot {
     border-color: var(--juniper);
     transform: scale(1.07);
+  }
+
+  /* Home and Health stay visibly optimistic while their PUT is pending. The
+     softer cursor/opacity communicates that a duplicate toggle is temporarily
+     unavailable without erasing the newly selected state. */
+  .check-control:disabled {
+    cursor: wait;
+    opacity: 0.68;
   }
 
   .check-control[aria-pressed="true"] .check-dot {
@@ -889,6 +1097,34 @@
     line-height: 1.56;
     overflow-wrap: anywhere;
     white-space: pre-line;
+  }
+
+  /* Health exercise strings arrive as compact separator-delimited prose. App.tsx
+     converts only multi-item workout details into this semantic list; these
+     styles keep the bullets readable without making a dense seven-day routine
+     feel visually heavier than neighboring task descriptions. */
+  .entry-workout-list {
+    max-width: 74ch;
+    margin: 8px 0 0;
+    padding-left: 1.15rem;
+    color: #66716b;
+    font-size: 0.82rem;
+    line-height: 1.5;
+  }
+
+  .entry-workout-list li {
+    padding-left: 0.15rem;
+    overflow-wrap: anywhere;
+  }
+
+  .entry-workout-list li + li {
+    margin-top: 3px;
+  }
+
+  /* The marker borrows the Health section's iris accent while the text retains
+     the same muted color used by ordinary entry details. */
+  .entry-workout-list li::marker {
+    color: var(--area-accent, var(--iris));
   }
 
   /* Metadata wraps independently so utility text cannot widen the prose column. */
@@ -1198,6 +1434,29 @@
       text-align: left;
     }
 
+    /* The modal keeps a modest outer gutter on phones and switches its footer
+       to equal-width controls, avoiding a narrow Save target beside a long
+       Cancel label. The textarea remains tall enough for practical editing. */
+    .prompt-dialog-backdrop {
+      align-items: end;
+      padding: 12px;
+    }
+
+    .prompt-dialog {
+      max-height: calc(100dvh - 24px);
+      padding: 22px;
+      border-radius: 14px;
+    }
+
+    .prompt-textarea {
+      min-height: 240px;
+    }
+
+    .prompt-dialog-actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+    }
+
     .area-icon {
       width: 32px;
       height: 32px;
@@ -1221,7 +1480,8 @@
       font-size: 0.9rem;
     }
 
-    .entry-copy > p {
+    .entry-copy > p,
+    .entry-workout-list {
       font-size: 0.79rem;
     }
 

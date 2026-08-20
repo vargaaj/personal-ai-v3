@@ -3,11 +3,13 @@
  *
  * This component loads translated `ReviewArea` objects through the frontend
  * data module, composes the responsive shell, derives the cross-area queue, and
- * applies completion updates in browser memory. Loading the saved JSON and
- * saving later LLM updates are separate responsibilities; this screen never
- * reads Supabase or understands database document shapes directly.
+ * applies completion updates, and persists the Home and Health checkbox states
+ * through the data module. Loading saved JSON and generating later LLM updates
+ * remain separate responsibilities; this screen never reads Supabase or
+ * understands database document shapes directly.
  */
 import { useEffect, useMemo, useRef, useState } from "react";
+import type { FormEvent } from "react";
 import {
   ArrowSquareOut,
   ArrowsClockwise,
@@ -25,44 +27,73 @@ import {
   X,
 } from "@phosphor-icons/react";
 import {
+  fetchAreaContentPrompt,
   fetchReviewAreaSnapshot,
   requestAreaContentUpdate,
   requestWeeklyAreaUpdate,
+  saveAreaContentPrompt,
+  saveAreaEntryState,
 } from "./data/areaContentApi";
-import type { WeeklyPlanAreaId } from "./data/areaContentApi";
+import type { PersistedEntryAreaId, RefreshableAreaId } from "./data/areaContentApi";
 import type { AreaId, EntryState, QueueFilter, ReviewArea } from "./domain/review";
 
 /** The three visible phases of the initial `/api/areas` request. */
 type AreaLoadState = "loading" | "ready" | "error";
 
-/** The visible phases of a person-triggered Health and Meals regeneration. */
+/** The visible phases of a person-triggered Home, Health, and Meals refresh. */
 type WeeklyUpdateState = "idle" | "updating" | "success" | "partial" | "error";
+
+/** The prompt dialog's request phases, kept separate from content refresh state. */
+type PromptDialogState = "loading" | "editing" | "saving" | "error";
 
 /** The visible phases and explanatory copy for one section-level update. */
 interface AreaUpdateFeedback {
-  state: "updating" | "success" | "error";
+  state: "updating" | "success" | "skipped" | "error";
   message: string;
 }
 
 /**
- * Supplies the user-facing name for each area with an individual update button.
- * Keeping this map exhaustive means a future weekly target must choose its
- * visible button and status wording when it is added to `WeeklyPlanAreaId`.
+ * Supplies the user-facing name for every visible database-backed area.
+ * Keeping this map exhaustive means a future prompt or refresh target must
+ * choose its visible button and status wording before it reaches this screen.
  */
-const weeklyPlanAreaNames: Record<WeeklyPlanAreaId, string> = {
+const refreshableAreaNames: Record<RefreshableAreaId, string> = {
+  home: "Home",
   health: "Health",
   meals: "Meals",
 };
 
 /**
- * Narrows a general Review area to one that the backend can regenerate today.
+ * A skipped update may mean another request is still saving the document.
+ * These three waits provide a bounded window for that save to appear without
+ * polling forever or making the Review screen look continuously busy.
+ */
+const SNAPSHOT_RECONCILIATION_DELAYS_MS = [1_500, 3_000, 6_000] as const;
+
+/**
+ * Narrows a general Review area to one backed by the current prompt and refresh API.
  *
  * TypeScript calls this a "type guard." After this function returns true,
- * App.tsx knows the value is specifically `"health"` or `"meals"` and permits
+ * App.tsx knows the value is specifically `"home"`, `"health"`, or `"meals"` and permits
  * it to be passed to `requestAreaContentUpdate`.
  */
-function isWeeklyPlanAreaId(areaId: AreaId): areaId is WeeklyPlanAreaId {
-  return areaId === "health" || areaId === "meals";
+function isRefreshableAreaId(areaId: AreaId): areaId is RefreshableAreaId {
+  return areaId === "home" || areaId === "health" || areaId === "meals";
+}
+
+/** Narrows a Review area to the Home and Health entry-state PUT contract. */
+function isPersistedEntryAreaId(areaId: AreaId): areaId is PersistedEntryAreaId {
+  return areaId === "home" || areaId === "health";
+}
+
+/** Creates one collision-safe identity for a checkbox save in progress. */
+function entrySaveKey(areaId: AreaId, entryId: string): string {
+  return `${areaId}\u0000${entryId}`;
+}
+
+/** Recognizes browser fetch cancellation without displaying it as a failure. */
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
 }
 
 /**
@@ -80,6 +111,43 @@ function formatAreaUpdatedAt(updatedAt: string): string {
     hour: "numeric",
     minute: "2-digit",
   }).format(new Date(updatedAt));
+}
+
+/**
+ * Turns backend area ids into natural-language labels for refresh feedback.
+ *
+ * The bulk API validator guarantees Home, Health, and Meals, but this fallback
+ * keeps an error message legible if a mocked or future caller supplies another
+ * id. Joining the names here prevents success copy from silently mentioning an
+ * area that was skipped or failed.
+ */
+function formatRefreshAreaNames(areaIds: string[]): string {
+  const names = areaIds.map(
+    (areaId) => refreshableAreaNames[areaId as RefreshableAreaId] ?? areaId,
+  );
+  if (names.length <= 1) return names[0] ?? "The selected area";
+  if (names.length === 2) return `${names[0]} and ${names[1]}`;
+  return `${names.slice(0, -1).join(", ")}, and ${names[names.length - 1]}`;
+}
+
+/**
+ * Separates a Health entry's compact workout instructions into scannable items.
+ *
+ * Stored and generated workout details currently use middle dots, bullet glyphs,
+ * or line breaks between exercises. Leading Markdown-style dashes and asterisks
+ * are removed because the interface supplies the real HTML list marker. A single
+ * uninterrupted sentence returns an empty array so the caller can preserve the
+ * ordinary paragraph presentation used by recovery days and legacy content.
+ *
+ * Called while ReviewApp renders each Health `ReviewEntry` below.
+ */
+function readWorkoutDetailItems(details: string): string[] {
+  const items = details
+    .split(/\s*(?:·|•|\r?\n)\s*/)
+    .map((item) => item.replace(/^[-*]\s+/, "").trim())
+    .filter((item) => item.length > 0);
+
+  return items.length > 1 ? items : [];
 }
 
 // Keep the label mapping exhaustive so adding a filter state produces a type
@@ -137,6 +205,11 @@ export default function ReviewApp() {
   const [updatedAtByArea, setUpdatedAtByArea] = useState<
     Partial<Record<AreaId, string>>
   >({});
+  // Reconciliation timers run after the click handler that scheduled them has
+  // returned. Keeping the newest timestamp map in a ref lets those delayed
+  // checks compare against the latest loaded snapshot instead of an older
+  // render's closed-over `updatedAtByArea` value.
+  const updatedAtByAreaRef = useRef<Partial<Record<AreaId, string>>>({});
 
   // Load state distinguishes a legitimate empty database from a request that
   // is still running or failed. Incrementing `loadAttempt` after an error reruns
@@ -148,25 +221,40 @@ export default function ReviewApp() {
   // The weekly update has its own state because it is a longer POST request,
   // separate from loading the currently saved areas. While it is "updating,"
   // the button is disabled so a double-click cannot start overlapping model
-  // requests for the same Health and Meals documents.
+  // requests for the same Home, Health, and Meals documents.
   const [weeklyUpdateState, setWeeklyUpdateState] = useState<WeeklyUpdateState>("idle");
   const [weeklyUpdateMessage, setWeeklyUpdateMessage] = useState("");
 
-  // Health and Meals keep separate feedback so a person who clicks the Health
-  // button sees the result beside Health rather than in the page-level weekly
-  // update message. A missing key means that section has not been updated during
+  // Home, Health, and Meals keep separate feedback so a person who clicks Home
+  // sees the result beside Home rather than in the page-level bulk-refresh
+  // message. A missing key means that section has not been refreshed during
   // this browser session.
   const [areaUpdateFeedback, setAreaUpdateFeedback] = useState<
-    Partial<Record<WeeklyPlanAreaId, AreaUpdateFeedback>>
+    Partial<Record<RefreshableAreaId, AreaUpdateFeedback>>
   >({});
 
-  // Only one model update may run at a time. This prevents an individual Health
-  // request and the combined weekly request from loading the same revision and
+  // Only one model update may run at a time. This prevents an individual Home,
+  // Health, or Meals request and the combined request from loading the same revision and
   // racing to save different replacements.
   const individualUpdateRunning =
+    areaUpdateFeedback.home?.state === "updating" ||
     areaUpdateFeedback.health?.state === "updating" ||
     areaUpdateFeedback.meals?.state === "updating";
   const updateInProgress = weeklyUpdateState === "updating" || individualUpdateRunning;
+
+  // Opening an editor stores both which section owns it and the exact text in
+  // the textarea. Saving never changes `areas` or `loadAttempt`: prompt edits
+  // affect only a later explicit refresh, so the current review stays stable.
+  const [promptDialogArea, setPromptDialogArea] = useState<RefreshableAreaId | null>(null);
+  const [promptDialogState, setPromptDialogState] = useState<PromptDialogState>("loading");
+  const [promptText, setPromptText] = useState("");
+  const [promptDialogError, setPromptDialogError] = useState("");
+
+  // Home and Health checkboxes save optimistically. React state drives the
+  // visible disabled controls, while the matching ref blocks a second event in
+  // the brief interval before React has rendered that disabled state.
+  const [savingEntryKeys, setSavingEntryKeys] = useState<Set<string>>(() => new Set());
+  const savingEntryKeysRef = useRef<Set<string>>(new Set());
 
   // Area selection, text search, and the Open/All/Completed filter are stored
   // separately. A person can therefore combine them—for example, show only
@@ -184,6 +272,22 @@ export default function ReviewApp() {
   const menuButtonRef = useRef<HTMLButtonElement>(null);
   const closeNavButtonRef = useRef<HTMLButtonElement>(null);
   const restoreMenuFocusRef = useRef(false);
+
+  // The editor remembers the control that opened it, then returns keyboard
+  // focus there when Cancel, Escape, or a successful Save closes the dialog.
+  const promptDialogRef = useRef<HTMLDivElement>(null);
+  const promptTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const promptDialogCloseRef = useRef<HTMLButtonElement>(null);
+  const promptEditTriggerRef = useRef<HTMLButtonElement>(null);
+  const restorePromptFocusRef = useRef(false);
+  const promptRequestControllerRef = useRef<AbortController | null>(null);
+
+  // Skipped update results start an unobtrusive snapshot check after a delay.
+  // A run number prevents an older timer or response from replacing a newer
+  // reconciliation, and both timer and fetch are canceled during unmount.
+  const snapshotReconciliationTimerRef = useRef<number | null>(null);
+  const snapshotReconciliationControllerRef = useRef<AbortController | null>(null);
+  const snapshotReconciliationRunRef = useRef(0);
 
   // When the last visible entry is completed, React replaces the queue with an
   // empty state. This reference lets the post-render effect focus that state's
@@ -226,6 +330,13 @@ export default function ReviewApp() {
 
     return () => requestController.abort();
   }, [loadAttempt]);
+
+  // Mirror the visible timestamp state for delayed skipped-refresh
+  // reconciliation. Updating this ref does not cause a render; it only gives
+  // async callbacks a current baseline to compare against.
+  useEffect(() => {
+    updatedAtByAreaRef.current = updatedAtByArea;
+  }, [updatedAtByArea]);
 
   // Global counts are derived from the same state as the rows so header and
   // navigation totals cannot drift after an in-memory completion change.
@@ -348,6 +459,77 @@ export default function ReviewApp() {
     };
   }, [navOpen]);
 
+  // The prompt editor is a true modal interaction. Background regions become
+  // inert in the render below, while this effect moves focus into the textarea,
+  // loops Tab within the dialog, handles Escape, and restores focus to the Edit
+  // prompt button that opened it. Cancel, close, and Escape remain available
+  // during a stalled PUT; closing aborts that request before removing the modal.
+  useEffect(() => {
+    if (!promptDialogArea) {
+      if (restorePromptFocusRef.current) {
+        restorePromptFocusRef.current = false;
+        promptEditTriggerRef.current?.focus();
+      }
+      return;
+    }
+
+    // Loading keeps the textarea disabled until its stored value is known, so
+    // focus the usable close control first. Once the editor becomes writable,
+    // shift focus to the text itself so a keyboard user can begin immediately.
+    if (promptDialogState === "editing") {
+      promptTextareaRef.current?.focus();
+    } else if (promptDialogState !== "saving") {
+      promptDialogCloseRef.current?.focus();
+    }
+
+    function handlePromptDialogKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closePromptEditor();
+        return;
+      }
+
+      if (event.key !== "Tab") return;
+
+      const dialog = promptDialogRef.current;
+      if (!dialog) return;
+      const dialogControls = Array.from(
+        dialog.querySelectorAll<HTMLElement>("textarea:not([disabled]), button:not([disabled])"),
+      );
+      const firstControl = dialogControls[0];
+      const lastControl = dialogControls[dialogControls.length - 1];
+      if (!firstControl || !lastControl) return;
+
+      if (event.shiftKey && document.activeElement === firstControl) {
+        event.preventDefault();
+        lastControl.focus();
+      } else if (!event.shiftKey && document.activeElement === lastControl) {
+        event.preventDefault();
+        firstControl.focus();
+      } else if (!dialog.contains(document.activeElement)) {
+        event.preventDefault();
+        firstControl.focus();
+      }
+    }
+
+    document.addEventListener("keydown", handlePromptDialogKeyDown);
+    return () => document.removeEventListener("keydown", handlePromptDialogKeyDown);
+  }, [promptDialogArea, promptDialogState]);
+
+  // Cancel in-flight prompt and reconciliation work on unmount. Clearing the
+  // delayed callback also guarantees a skipped refresh cannot issue a later GET
+  // after the Review screen has been removed.
+  useEffect(
+    () => () => {
+      promptRequestControllerRef.current?.abort();
+      snapshotReconciliationControllerRef.current?.abort();
+      if (snapshotReconciliationTimerRef.current !== null) {
+        window.clearTimeout(snapshotReconciliationTimerRef.current);
+      }
+    },
+    [],
+  );
+
   // Focus the empty-state reset only after React has removed the final visible
   // row and mounted the replacement control.
   useEffect(() => {
@@ -405,12 +587,207 @@ export default function ReviewApp() {
   }
 
   /**
-   * Regenerates the saved Health and Meals plans after a button click.
+   * Stops a delayed snapshot reconciliation before a newer refresh begins.
+   *
+   * Only one refresh request can run at once, but a completed skipped request
+   * may still have timers waiting. Canceling them prevents an older snapshot
+   * from replacing content loaded by the person's newer refresh.
+   */
+  function cancelSnapshotReconciliation() {
+    snapshotReconciliationRunRef.current += 1;
+    snapshotReconciliationControllerRef.current?.abort();
+    snapshotReconciliationControllerRef.current = null;
+    if (snapshotReconciliationTimerRef.current !== null) {
+      window.clearTimeout(snapshotReconciliationTimerRef.current);
+      snapshotReconciliationTimerRef.current = null;
+    }
+  }
+
+  /**
+   * Checks for a newer saved snapshot after one or more update results skip.
+   *
+   * Go uses `skipped` when another request may already own the same update. The
+   * page keeps its honest skipped message, waits, then loads a snapshot without
+   * showing a success state. A changed timestamp ends the checks; otherwise the
+   * fixed delay list bounds both request count and total lifetime.
+   */
+  function scheduleSnapshotReconciliation(areaIds: RefreshableAreaId[]) {
+    cancelSnapshotReconciliation();
+
+    const targetAreaIds = [...new Set(areaIds)];
+    const baselineUpdatedAt = Object.fromEntries(
+      targetAreaIds.map((areaId) => [areaId, updatedAtByAreaRef.current[areaId]]),
+    ) as Partial<Record<RefreshableAreaId, string>>;
+    const reconciliationRun = snapshotReconciliationRunRef.current;
+
+    function scheduleAttempt(attemptIndex: number) {
+      const delay = SNAPSHOT_RECONCILIATION_DELAYS_MS[attemptIndex];
+      if (delay === undefined || snapshotReconciliationRunRef.current !== reconciliationRun) return;
+
+      snapshotReconciliationTimerRef.current = window.setTimeout(async () => {
+        snapshotReconciliationTimerRef.current = null;
+        const requestController = new AbortController();
+        snapshotReconciliationControllerRef.current = requestController;
+
+        try {
+          const snapshot = await fetchReviewAreaSnapshot(requestController.signal);
+          if (
+            requestController.signal.aborted ||
+            snapshotReconciliationRunRef.current !== reconciliationRun
+          ) {
+            return;
+          }
+
+          // Content and timestamps always move together, just as they do during
+          // the initial load, but reconciliation does not replace the page with
+          // a loading screen or rewrite the existing skipped status message.
+          setAreas(snapshot.areas);
+          setUpdatedAtByArea(snapshot.updatedAtByArea);
+
+          const allTargetsChanged = targetAreaIds.every(
+            (areaId) => snapshot.updatedAtByArea[areaId] !== baselineUpdatedAt[areaId],
+          );
+          if (!allTargetsChanged) scheduleAttempt(attemptIndex + 1);
+        } catch (error: unknown) {
+          if (requestController.signal.aborted || isAbortError(error)) return;
+          scheduleAttempt(attemptIndex + 1);
+        } finally {
+          if (snapshotReconciliationControllerRef.current === requestController) {
+            snapshotReconciliationControllerRef.current = null;
+          }
+        }
+      }, delay);
+    }
+
+    scheduleAttempt(0);
+  }
+
+  /**
+   * Requests the saved instructions for an open prompt editor.
+   *
+   * The GET endpoint returns 404 when no enabled prompt exists. The API helper
+   * turns that expected case into `null`, so the textarea becomes an empty
+   * create form. Other failures leave the dialog open with a retry action and
+   * never turn a failed load into an accidental blank overwrite.
+   */
+  async function loadAreaPrompt(areaId: RefreshableAreaId) {
+    promptRequestControllerRef.current?.abort();
+    const requestController = new AbortController();
+    promptRequestControllerRef.current = requestController;
+    setPromptDialogState("loading");
+    setPromptDialogError("");
+
+    try {
+      const savedPrompt = await fetchAreaContentPrompt(areaId, requestController.signal);
+      if (requestController.signal.aborted) return;
+
+      setPromptText(savedPrompt?.prompt ?? "");
+      setPromptDialogState("editing");
+    } catch (error: unknown) {
+      if (requestController.signal.aborted || isAbortError(error)) return;
+
+      const message = error instanceof Error ? error.message : "Unable to load the prompt.";
+      setPromptDialogError(`${message} Try again or cancel without making changes.`);
+      setPromptDialogState("error");
+    } finally {
+      if (promptRequestControllerRef.current === requestController) {
+        promptRequestControllerRef.current = null;
+      }
+    }
+  }
+
+  /**
+   * Opens the named area's prompt dialog from its section heading.
+   *
+   * Capturing `trigger` before React renders the dialog gives Cancel, Escape,
+   * and successful Save one reliable place to restore focus. Starting with a
+   * blank local value also prevents the previously opened area's instructions
+   * from appearing while this area's GET request is loading.
+   */
+  function openPromptEditor(areaId: RefreshableAreaId, trigger: HTMLButtonElement) {
+    // Native disabled controls block ordinary clicks during refresh. This guard
+    // also rejects a programmatic call before React paints that disabled state.
+    if (updateInProgress) return;
+
+    promptEditTriggerRef.current = trigger;
+    restorePromptFocusRef.current = false;
+    setPromptDialogArea(areaId);
+    setPromptText("");
+    void loadAreaPrompt(areaId);
+  }
+
+  /**
+   * Closes the prompt editor without saving and returns focus to its trigger.
+   *
+   * Cancel, the close icon, and Escape call this function. If a GET or PUT has
+   * stalled, aborting it first ensures a late response cannot change state or
+   * announce an error after the dialog has already disappeared.
+   */
+  function closePromptEditor() {
+    if (!promptDialogArea) return;
+
+    promptRequestControllerRef.current?.abort();
+    promptRequestControllerRef.current = null;
+    restorePromptFocusRef.current = true;
+    setPromptDialogArea(null);
+    setPromptDialogError("");
+  }
+
+  /**
+   * Saves a non-blank prompt without regenerating the area's content.
+   *
+   * Submitting the dialog form calls this function. Whitespace-only text is
+   * rejected even if a caller bypasses the disabled Save button. On success the
+   * dialog closes and focus returns to Edit prompt; `loadAttempt` is untouched,
+   * proving that saving instructions does not refresh the Review queue.
+   */
+  async function savePromptEditor(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!promptDialogArea || promptDialogState === "saving") return;
+
+    if (promptText.trim() === "") {
+      setPromptDialogError("Enter prompt instructions before saving.");
+      setPromptDialogState("editing");
+      promptTextareaRef.current?.focus();
+      return;
+    }
+
+    const areaId = promptDialogArea;
+    promptRequestControllerRef.current?.abort();
+    const requestController = new AbortController();
+    promptRequestControllerRef.current = requestController;
+    setPromptDialogState("saving");
+    setPromptDialogError("");
+
+    try {
+      await saveAreaContentPrompt(areaId, promptText, requestController.signal);
+      if (requestController.signal.aborted) return;
+
+      // Do not increment loadAttempt here. The API contract persists only the
+      // prompt, and preserving the visible entries confirms no regeneration ran.
+      restorePromptFocusRef.current = true;
+      setPromptDialogArea(null);
+    } catch (error: unknown) {
+      if (requestController.signal.aborted || isAbortError(error)) return;
+
+      const message = error instanceof Error ? error.message : "Unable to save the prompt.";
+      setPromptDialogError(`${message} Your entered prompt is still available to edit.`);
+      setPromptDialogState("editing");
+    } finally {
+      if (promptRequestControllerRef.current === requestController) {
+        promptRequestControllerRef.current = null;
+      }
+    }
+  }
+
+  /**
+   * Regenerates the saved Home, Health, and Meals content after a button click.
    *
    * The POST request does not finish until Go has called OpenRouter, validated
-   * the returned JSON, and attempted to save both documents. Successful or
-   * partially successful runs increment `loadAttempt`, which reruns the GET
-   * effect above and replaces the visible rows with the latest saved content.
+   * the returned JSON, and attempted to save all three documents. Only an
+   * `updated` result increments `loadAttempt`. A `skipped` result does not claim
+   * success; it schedules the bounded background reconciliation described above
+   * in case another request is still finishing the same document.
    */
   async function updateWeeklyPlans() {
     // The disabled button normally prevents a second call. This guard also
@@ -418,64 +795,78 @@ export default function ReviewApp() {
     // is already in progress.
     if (updateInProgress) return;
 
+    cancelSnapshotReconciliation();
     setWeeklyUpdateState("updating");
-    setWeeklyUpdateMessage("Updating Health and Meals. This can take a minute.");
+    setWeeklyUpdateMessage("Updating Home, Health, and Meals. This can take a minute.");
 
     try {
       const results = await requestWeeklyAreaUpdate();
       const failedResults = results.filter((result) => result.status === "failed");
-      const savedResults = results.filter((result) => result.status !== "failed");
+      const updatedResults = results.filter((result) => result.status === "updated");
+      const skippedResults = results.filter((result) => result.status === "skipped");
 
-      // Reload when at least one document was saved or confirmed current. A
-      // partial result should still reveal the section that updated correctly.
-      if (savedResults.length > 0) {
+      if (skippedResults.length > 0) {
+        scheduleSnapshotReconciliation(
+          skippedResults.map((result) => result.areaId as RefreshableAreaId),
+        );
+      }
+
+      // A skipped response reports that no fresh content was saved. Reload only
+      // when at least one target actually produced a new revision to display.
+      if (updatedResults.length > 0) {
         setLoadAttempt((currentAttempt) => currentAttempt + 1);
       }
 
-      if (failedResults.length === 0 && results.length > 0) {
+      if (failedResults.length === 0 && skippedResults.length === 0) {
         setWeeklyUpdateState("success");
-        setWeeklyUpdateMessage("Health and Meals updated. The latest weekly plans are now loaded.");
+        setWeeklyUpdateMessage("Home, Health, and Meals updated. The latest content is now loaded.");
         return;
       }
 
-      const failedAreaNames = failedResults.map((result) =>
-        result.areaId.charAt(0).toLocaleUpperCase() + result.areaId.slice(1),
-      );
-      const failedAreaLabel = failedAreaNames.join(" and ") || "The weekly plans";
-
-      if (savedResults.length > 0) {
-        setWeeklyUpdateState("partial");
-        setWeeklyUpdateMessage(
-          `${failedAreaLabel} could not be updated. The other weekly plan is ready.`,
+      const feedbackSentences: string[] = [];
+      if (updatedResults.length > 0) {
+        feedbackSentences.push(`${formatRefreshAreaNames(updatedResults.map((result) => result.areaId))} updated.`);
+      }
+      if (skippedResults.length > 0) {
+        const skippedNames = formatRefreshAreaNames(skippedResults.map((result) => result.areaId));
+        feedbackSentences.push(
+          `${skippedNames} ${skippedResults.length === 1 ? "was" : "were"} not refreshed; an update may already be in progress.`,
         );
-        return;
+      }
+      if (failedResults.length > 0) {
+        feedbackSentences.push(
+          `${formatRefreshAreaNames(failedResults.map((result) => result.areaId))} could not be updated.`,
+        );
       }
 
-      setWeeklyUpdateState("error");
-      setWeeklyUpdateMessage(`${failedAreaLabel} could not be updated. Try the update again.`);
+      setWeeklyUpdateState(updatedResults.length > 0 || skippedResults.length > 0 ? "partial" : "error");
+      setWeeklyUpdateMessage(
+        `${feedbackSentences.join(" ")}${updatedResults.length === 0 && skippedResults.length === 0 ? " Try the update again." : ""}`,
+      );
     } catch {
       // Network and non-successful HTTP responses use stable interface copy.
       // Detailed provider or database failures remain in the Go server logs.
       setWeeklyUpdateState("error");
-      setWeeklyUpdateMessage("The weekly plans could not be updated. Check the server and try again.");
+      setWeeklyUpdateMessage("Home, Health, and Meals could not be updated. Check the server and try again.");
     }
   }
 
   /**
    * Regenerates one plan when its section-level Refresh button is clicked.
    *
-   * `areaId` identifies either the Health workout document or the Meals
+   * `areaId` identifies the Home maintenance, Health workout, or Meals
    * recommendations document. The request remains pending while Go loads that
    * area's prompt, calls OpenRouter, validates the JSON, and saves the new
    * revision. A successful result reloads `/api/areas`, which replaces the
    * visible section entries with the newly saved plan.
    */
-  async function updateAreaPlan(areaId: WeeklyPlanAreaId) {
+  async function updateAreaPlan(areaId: RefreshableAreaId) {
     // Disabled controls normally prevent overlap. This guard also protects
     // programmatic calls made before React has rendered the disabled state.
     if (updateInProgress) return;
 
-    const areaName = weeklyPlanAreaNames[areaId];
+    cancelSnapshotReconciliation();
+    const areaName = refreshableAreaNames[areaId];
     setAreaUpdateFeedback((currentFeedback) => ({
       ...currentFeedback,
       [areaId]: {
@@ -501,6 +892,20 @@ export default function ReviewApp() {
         return;
       }
 
+      // A skipped individual request did not save new content. Keep the current
+      // rows and say why instead of treating a concurrency safeguard as success.
+      if (result.status === "skipped") {
+        scheduleSnapshotReconciliation([areaId]);
+        setAreaUpdateFeedback((currentFeedback) => ({
+          ...currentFeedback,
+          [areaId]: {
+            state: "skipped",
+            message: `${areaName} was not refreshed; an update may already be in progress.`,
+          },
+        }));
+        return;
+      }
+
       // Incrementing this counter reruns the existing areas GET effect. The
       // section then renders the database revision that Go just saved.
       setLoadAttempt((currentAttempt) => currentAttempt + 1);
@@ -508,7 +913,7 @@ export default function ReviewApp() {
         ...currentFeedback,
         [areaId]: {
           state: "success",
-          message: `${areaName} updated. The latest plan is now loaded.`,
+          message: `${areaName} updated. The latest content is now loaded.`,
         },
       }));
     } catch {
@@ -575,15 +980,26 @@ export default function ReviewApp() {
    * changes only its `state`, and leaves every other area and entry unchanged.
    *
    * React then recalculates the open/completed counts and redraws the filtered
-   * queue. When the Open filter is active, an entry that was marked done
-   * disappears from that view. This is currently an in-memory change; a future
-   * data-service module will save the same change to the real backend.
+   * queue. Home and Health immediately send the same state to Go; a failed PUT
+   * restores the previous state and announces the safe failure. Meals and the
+   * fixture-only areas intentionally remain browser-only because their rendered
+   * entries do not have the confirmed entry-state persistence contract.
    */
-  function toggleEntry(areaId: AreaId, entryId: string, trigger: HTMLButtonElement) {
+  async function toggleEntry(areaId: AreaId, entryId: string, trigger: HTMLButtonElement) {
     // Resolve the current entry before updating so both the next state and the
     // accessibility announcement describe the exact same transition.
     const entry = areas.find((area) => area.id === areaId)?.entries.find((candidate) => candidate.id === entryId);
     if (!entry) return;
+
+    const persistsEntryState = isPersistedEntryAreaId(areaId);
+    const saveKey = entrySaveKey(areaId, entryId);
+    if (persistsEntryState) {
+      // The ref changes synchronously, closing the double-click window before
+      // the disabled button produced by React can receive its next render.
+      if (savingEntryKeysRef.current.has(saveKey)) return;
+      savingEntryKeysRef.current.add(saveKey);
+      setSavingEntryKeys(new Set(savingEntryKeysRef.current));
+    }
 
     const nextState: EntryState = entry.state === "open" ? "done" : "open";
 
@@ -611,6 +1027,37 @@ export default function ReviewApp() {
     );
 
     setAnnouncement(`${entry.title} marked ${nextState}.`);
+
+    // Meals recommendations and fixture-only entries have no matching backend
+    // entry-state route. Their checkboxes deliberately last for this browser
+    // session only, matching the data adapter's generated local ids.
+    if (!persistsEntryState) return;
+
+    try {
+      await saveAreaEntryState(areaId, entryId, nextState);
+    } catch {
+      // Restore only the state this request applied. This condition avoids
+      // overwriting a newer snapshot if another screen-level load replaced the
+      // entry while the PUT was pending.
+      setAreas((currentAreas) =>
+        currentAreas.map((area) => {
+          if (area.id !== areaId) return area;
+
+          return {
+            ...area,
+            entries: area.entries.map((currentEntry) =>
+              currentEntry.id === entryId && currentEntry.state === nextState
+                ? { ...currentEntry, state: entry.state }
+                : currentEntry,
+            ),
+          };
+        }),
+      );
+      setAnnouncement(`Could not save ${entry.title}. Its previous state was restored.`);
+    } finally {
+      savingEntryKeysRef.current.delete(saveKey);
+      setSavingEntryKeys(new Set(savingEntryKeysRef.current));
+    }
   }
 
   return (
@@ -633,6 +1080,7 @@ export default function ReviewApp() {
         aria-label="Primary navigation"
         aria-modal={navOpen || undefined}
         role={navOpen ? "dialog" : undefined}
+        inert={promptDialogArea ? true : undefined}
       >
         <div className="brand-row">
           {/* These three empty spans are drawing hooks for the small brand mark.
@@ -696,7 +1144,7 @@ export default function ReviewApp() {
 
       {/* This compact header exists only below the desktop breakpoint and keeps
           the current open count visible without consuming review space. */}
-      <header className="mobile-header" inert={navOpen ? true : undefined}>
+      <header className="mobile-header" inert={navOpen || promptDialogArea ? true : undefined}>
         <button
           ref={menuButtonRef}
           className="icon-button"
@@ -712,7 +1160,7 @@ export default function ReviewApp() {
         <span className="mobile-open-count">{openCount} open</span>
       </header>
 
-      <main className="main-content" inert={navOpen ? true : undefined}>
+      <main className="main-content" inert={navOpen || promptDialogArea ? true : undefined}>
         <div className="main-inner">
           {/* The page header states the session's job and adapts its copy when a
               single area is selected from navigation or the cadence rail. */}
@@ -722,7 +1170,7 @@ export default function ReviewApp() {
               <h1>{activeAreaName ? `${activeAreaName}, at a glance.` : "What needs your attention."}</h1>
               <p className="page-summary">
                 {areaLoadState === "loading"
-                  ? "Loading your current Home, Health, Reading, and Meals review."
+                  ? "Loading your current Home, Health, and Meals review."
                   : areaLoadState === "error"
                     ? "Your saved review data could not be loaded. You can retry below."
                     : activeAreaName
@@ -748,8 +1196,8 @@ export default function ReviewApp() {
                   aria-hidden="true"
                 />
                 {weeklyUpdateState === "updating"
-                  ? "Updating weekly plans…"
-                  : "Refresh weekly plans"}
+                  ? "Updating Home, Health, and Meals…"
+                  : "Refresh Home, Health, and Meals"}
               </button>
 
               <div className="cleared-note" aria-label={`${doneCount} completed entries`}>
@@ -825,12 +1273,12 @@ export default function ReviewApp() {
                 const areaOpenCount = area.entries.filter((entry) => entry.state === "open").length;
                 const areaUpdatedAt = updatedAtByArea[area.id];
 
-                // Only Health and Meals currently have stored update prompts.
-                // Narrowing here lets the rest of the section render normally
-                // for every area while adding controls only to those two.
-                const weeklyPlanAreaId = isWeeklyPlanAreaId(area.id) ? area.id : null;
-                const updateFeedback = weeklyPlanAreaId
-                  ? areaUpdateFeedback[weeklyPlanAreaId]
+                // Mail and Money are fixture-only review areas. Home, Health,
+                // and Meals are backed by the configured API, so every rendered
+                // section in that set receives both Edit prompt and Refresh.
+                const refreshableAreaId = isRefreshableAreaId(area.id) ? area.id : null;
+                const updateFeedback = refreshableAreaId
+                  ? areaUpdateFeedback[refreshableAreaId]
                   : undefined;
                 return (
                   <section className={`area-section accent-${area.accent}`} aria-labelledby={`area-${area.id}`} key={area.id}>
@@ -867,15 +1315,28 @@ export default function ReviewApp() {
                         )}
                       </div>
 
-                      {weeklyPlanAreaId && (
+                      {refreshableAreaId && (
                         <div className="area-update-actions">
+                          {/* Edit prompt is disabled during every content refresh.
+                              A bulk request processes areas sequentially, so a
+                              prompt changed mid-run could otherwise affect only
+                              the targets Go has not reached yet. */}
+                          <button
+                            className="area-prompt-button"
+                            type="button"
+                            onClick={(event) => openPromptEditor(refreshableAreaId, event.currentTarget)}
+                            disabled={updateInProgress}
+                          >
+                            Edit {area.name} prompt
+                          </button>
+
                           {/* This secondary action refreshes only the section
                               whose heading contains it. All refresh controls are
                               disabled during the request to avoid revision races. */}
                           <button
                             className="area-update-button"
                             type="button"
-                            onClick={() => updateAreaPlan(weeklyPlanAreaId)}
+                            onClick={() => updateAreaPlan(refreshableAreaId)}
                             disabled={updateInProgress}
                             aria-busy={updateFeedback?.state === "updating"}
                           >
@@ -902,51 +1363,79 @@ export default function ReviewApp() {
                     </div>
 
                     <div className="entry-list">
-                      {area.entries.map((entry) => (
-                        <article className={`entry-row ${entry.state === "done" ? "is-done" : ""}`} key={entry.id}>
-                          {/* A button is used instead of a native checkbox because
-                              this action will eventually save to the backend,
-                              update the screen immediately, and report a saving
-                              error if the backend rejects the change. */}
-                          <button
-                            className="check-control"
-                            type="button"
-                            onClick={(event) => toggleEntry(area.id, entry.id, event.currentTarget)}
-                            aria-label={`${entry.state === "open" ? "Mark" : "Restore"} ${entry.title}`}
-                            aria-pressed={entry.state === "done"}
+                      {area.entries.map((entry) => {
+                        // Only Health interprets separators as workout boundaries.
+                        // Mail summaries, Home instructions, and meal descriptions
+                        // keep their original prose even if they contain line breaks.
+                        const workoutDetailItems =
+                          area.id === "health" && entry.details
+                            ? readWorkoutDetailItems(entry.details)
+                            : [];
+
+                        return (
+                          <article
+                            className={`entry-row ${entry.state === "done" ? "is-done" : ""}`}
+                            key={entry.id}
                           >
-                            <span className="check-dot">
-                              {entry.state === "done" && <Check size={14} weight="bold" aria-hidden="true" />}
-                            </span>
-                          </button>
+                            {/* A button is used instead of a native checkbox so the
+                                interface can update immediately, expose a saving
+                                state for persisted Home and Health rows, and roll
+                                back if the backend rejects either change. */}
+                            <button
+                              className="check-control"
+                              type="button"
+                              onClick={(event) => void toggleEntry(area.id, entry.id, event.currentTarget)}
+                              disabled={savingEntryKeys.has(entrySaveKey(area.id, entry.id))}
+                              aria-label={`${entry.state === "open" ? "Mark" : "Restore"} ${entry.title}`}
+                              aria-pressed={entry.state === "done"}
+                              aria-busy={savingEntryKeys.has(entrySaveKey(area.id, entry.id))}
+                            >
+                              <span className="check-dot">
+                                {entry.state === "done" && <Check size={14} weight="bold" aria-hidden="true" />}
+                              </span>
+                            </button>
 
-                          <div className="entry-copy">
-                            <h3>{entry.title}</h3>
-                            {entry.details && <p>{entry.details}</p>}
-                            <div className="entry-metadata" aria-label="Entry details">
-                              {entry.metadata.map((item) => (
-                                // The attention class adds a dot, while the label
-                                // and value continue to carry semantic meaning.
-                                <span className={item.attention ? "needs-attention" : ""} key={`${item.label}-${item.value}`}>
-                                  <b>{item.label}</b> {item.value}
-                                </span>
-                              ))}
+                            <div className="entry-copy">
+                              <h3>{entry.title}</h3>
+                              {workoutDetailItems.length > 0 ? (
+                                // A real list gives screen-reader and keyboard-tool
+                                // users the same item boundaries visible as bullets.
+                                <ul
+                                  className="entry-workout-list"
+                                  aria-label={`Exercises for ${entry.title}`}
+                                >
+                                  {workoutDetailItems.map((item, itemIndex) => (
+                                    <li key={`${entry.id}-workout-${itemIndex}`}>{item}</li>
+                                  ))}
+                                </ul>
+                              ) : (
+                                entry.details && <p>{entry.details}</p>
+                              )}
+                              <div className="entry-metadata" aria-label="Entry details">
+                                {entry.metadata.map((item) => (
+                                  // The attention class adds a dot, while the label
+                                  // and value continue to carry semantic meaning.
+                                  <span className={item.attention ? "needs-attention" : ""} key={`${item.label}-${item.value}`}>
+                                    <b>{item.label}</b> {item.value}
+                                  </span>
+                                ))}
+                              </div>
                             </div>
-                          </div>
 
-                          {entry.href ? (
-                            // Source links open separately so the review session
-                            // remains intact when a person follows supporting context.
-                            <a className="entry-link" href={entry.href} target="_blank" rel="noreferrer" aria-label={`Open ${entry.title}`}>
-                              <ArrowSquareOut size={18} aria-hidden="true" />
-                            </a>
-                          ) : (
-                            // Preserve the grid column when an entry has no link,
-                            // keeping text alignment stable across sibling rows.
-                            <span className="entry-link-spacer" />
-                          )}
-                        </article>
-                      ))}
+                            {entry.href ? (
+                              // Source links open separately so the review session
+                              // remains intact when a person follows supporting context.
+                              <a className="entry-link" href={entry.href} target="_blank" rel="noreferrer" aria-label={`Open ${entry.title}`}>
+                                <ArrowSquareOut size={18} aria-hidden="true" />
+                              </a>
+                            ) : (
+                              // Preserve the grid column when an entry has no link,
+                              // keeping text alignment stable across sibling rows.
+                              <span className="entry-link-spacer" />
+                            )}
+                          </article>
+                        );
+                      })}
                     </div>
                   </section>
                 );
@@ -973,6 +1462,108 @@ export default function ReviewApp() {
           <p className="sr-only" aria-live="polite">{announcement}</p>
         </div>
       </main>
+
+      {promptDialogArea && (
+        /* This sibling follows the inert background in DOM order. Its labelled
+           dialog role, modal semantics, focus loop, and Escape path make the
+           prompt editor usable without a mouse on both desktop and mobile. */
+        <div className="prompt-dialog-backdrop">
+          <div
+            ref={promptDialogRef}
+            className="prompt-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="prompt-dialog-title"
+            aria-describedby="prompt-dialog-description"
+          >
+            <div className="prompt-dialog-heading">
+              <div>
+                <p className="eyebrow">Generation instructions</p>
+                <h2 id="prompt-dialog-title">Edit {refreshableAreaNames[promptDialogArea]} prompt</h2>
+              </div>
+              <button
+                ref={promptDialogCloseRef}
+                className="prompt-dialog-close"
+                type="button"
+                onClick={closePromptEditor}
+                aria-label="Cancel editing prompt"
+              >
+                <X size={20} aria-hidden="true" />
+              </button>
+            </div>
+
+            <p id="prompt-dialog-description">
+              These instructions apply the next time {refreshableAreaNames[promptDialogArea]} is refreshed.
+              Saving does not refresh the content shown now.
+            </p>
+
+            <form onSubmit={savePromptEditor}>
+              <label className="prompt-textarea-label" htmlFor="area-prompt-text">
+                Prompt instructions
+              </label>
+              <textarea
+                ref={promptTextareaRef}
+                id="area-prompt-text"
+                className="prompt-textarea"
+                value={promptText}
+                onChange={(event) => {
+                  setPromptText(event.target.value);
+                  if (promptDialogError) setPromptDialogError("");
+                }}
+                disabled={
+                  promptDialogState === "loading" ||
+                  promptDialogState === "saving" ||
+                  promptDialogState === "error"
+                }
+                aria-invalid={promptDialogError ? true : undefined}
+                aria-describedby={promptDialogError ? "prompt-dialog-error" : undefined}
+                rows={14}
+              />
+
+              {promptDialogState === "loading" && (
+                <p className="prompt-dialog-message" role="status">Loading the saved prompt…</p>
+              )}
+              {promptDialogError && (
+                <p id="prompt-dialog-error" className="prompt-dialog-message is-error" role="alert">
+                  {promptDialogError}
+                </p>
+              )}
+
+              <div className="prompt-dialog-actions">
+                <button
+                  type="button"
+                  className="prompt-cancel-button"
+                  onClick={closePromptEditor}
+                >
+                  Cancel
+                </button>
+                {promptDialogState === "error" ? (
+                  <button
+                    type="button"
+                    className="prompt-save-button"
+                    onClick={() => void loadAreaPrompt(promptDialogArea)}
+                  >
+                    Try again
+                  </button>
+                ) : (
+                  <button
+                    type="submit"
+                    className="prompt-save-button"
+                    disabled={
+                      promptDialogState === "loading" ||
+                      (promptDialogState === "editing" && promptText.trim() === "")
+                    }
+                    aria-disabled={promptDialogState === "saving" ? true : undefined}
+                    aria-busy={promptDialogState === "saving"}
+                  >
+                    {promptDialogState === "saving" ? "Saving prompt…" : "Save prompt"}
+                  </button>
+                )}
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
 
     </div>
   );

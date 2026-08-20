@@ -1,11 +1,11 @@
 /**
  * The frontend boundary for area content loaded from the Go API.
  *
- * Supabase stores independently shaped JSON documents: Home, Health, and
- * Reading contain ordinary review entries, while Meals contains weekly meal
- * recommendations. This module translates both database shapes into the one
- * `ReviewArea` model rendered by App.tsx. Components therefore do not need to
- * know table names, content types, or meal-specific database fields.
+ * Supabase stores independently shaped JSON documents: Home and Health contain
+ * ordinary review entries, while Meals contains weekly meal recommendations.
+ * This module translates both database shapes into the one `ReviewArea` model
+ * rendered by App.tsx. Components therefore do not need to know table names,
+ * content types, or meal-specific database fields.
  *
  * The complete loading sequence is:
  *
@@ -26,8 +26,8 @@
  * 5. `adaptAreaContents` walks `areaDefinitions` in display order and finds the
  *    matching area/content-type pair. Rows without a definition are ignored,
  *    so adding a backend document alone cannot create a broken navigation item.
- * 6. Home, Health, and Reading go through `readEntryDocument`, which extracts
- *    their `entries` arrays. Each item then passes through `readReviewEntry` and
+ * 6. Home and Health go through `readEntryDocument`, which extracts their
+ *    `entries` arrays. Each item then passes through `readReviewEntry` and
  *    `readMetadata` so ids, titles, states, optional details, links, and visible
  *    metadata have the exact shape expected by the Review screen.
  * 7. Meals follows its separate stored shape through `readMealRecommendations`.
@@ -53,8 +53,43 @@ import type {
   ReviewEntry,
 } from "../domain/review";
 
-/** The four database-backed areas currently seeded in Supabase. */
-type StoredAreaId = "home" | "health" | "reading" | "meals";
+/** The three database-backed areas currently shown by the Review screen. */
+export type RefreshableAreaId = "home" | "health" | "meals";
+
+/** Areas whose individual entry state is stored by the current backend contract. */
+export type PersistedEntryAreaId = "home" | "health";
+
+/** Internal name for the same persisted-area union used by data adapters. */
+type StoredAreaId = RefreshableAreaId;
+
+/**
+ * One saved generation prompt owned by the database.
+ *
+ * The API uses snake_case field names, but React callers use this camelCase
+ * representation. The prompt is deliberately separate from area content:
+ * editing instructions changes what a future refresh will generate and never
+ * replaces the entries currently visible on the Review screen.
+ */
+export interface AreaContentPrompt {
+  areaId: StoredAreaId;
+  contentType: string;
+  prompt: string;
+}
+
+/**
+ * The confirmed state of one Home or Health entry after Go saves it.
+ *
+ * React applies the same state before this response arrives so the checkbox
+ * feels immediate. Returning every identity field lets the helper reject a
+ * successful-looking response for a different entry before React accepts it.
+ */
+export interface AreaEntryStateUpdate {
+  areaId: PersistedEntryAreaId;
+  contentType: string;
+  entryId: string;
+  state: EntryState;
+  revision: number;
+}
 
 /** Display information stays in the frontend rather than being repeated in every database row. */
 interface AreaDefinition {
@@ -85,18 +120,18 @@ export interface ReviewAreaSnapshot {
   updatedAtByArea: Partial<Record<AreaId, string>>;
 }
 
-/** The three per-section outcomes returned by Go after a weekly update request. */
+/** The three per-section outcomes returned by Go after a content refresh request. */
 export type WeeklyAreaUpdateStatus = "updated" | "skipped" | "failed";
 
 /**
- * The two Review areas that currently have their own update prompts and backend
- * targets. Using this narrower type prevents Mail, Home, Reading, or Money from
- * being sent to an endpoint that intentionally supports only weekly plans.
+ * Compatibility name for callers that already refer to the bulk refresh flow.
+ * Home now uses the same configured refresh route as Health and Meals, so this
+ * union represents every visible database-backed target rather than only plans.
  */
-export type WeeklyPlanAreaId = "health" | "meals";
+export type WeeklyPlanAreaId = RefreshableAreaId;
 
 /**
- * One Health or Meals result returned by the manual weekly-update endpoint.
+ * One Home, Health, or Meals result returned by a manual refresh endpoint.
  *
  * `revision` and `updatedAt` are optional because a failed update was never
  * saved. Keeping those fields optional makes the browser model match that
@@ -111,17 +146,38 @@ export interface WeeklyAreaUpdateResult {
 }
 
 /**
- * Connects each visible weekly area to the exact `content_type` stored by Go.
+ * Connects each refreshable visible area to the exact `content_type` stored by Go.
  *
- * React callers only choose a recognizable area such as `"health"`. This map
+ * React callers only choose a recognizable area such as `"home"`. This map
  * owns the database-facing detail needed to build and verify the individual
  * update route, so App.tsx never has to repeat strings such as
  * `"weekly_workout_routine"`.
  */
-const weeklyPlanContentTypes: Record<WeeklyPlanAreaId, string> = {
+const refreshableAreaContentTypes: Record<RefreshableAreaId, string> = {
+  home: "maintenance_tasks",
   health: "weekly_workout_routine",
   meals: "weekly_meal_recommendations",
 };
+
+/**
+ * Entry-level state writes exist only for document shapes with stored entries.
+ * Meals recommendations are translated into review rows in the browser and do
+ * not have backend entry ids, so they are deliberately absent from this map.
+ */
+const persistedEntryContentTypes: Record<PersistedEntryAreaId, string> = {
+  home: refreshableAreaContentTypes.home,
+  health: refreshableAreaContentTypes.health,
+};
+
+/**
+ * The bulk endpoint is a fixed all-or-nothing response contract, unlike an
+ * individual section route. Listing the expected pairs in one place lets the
+ * client reject a response that omits Home, repeats Meals, or invents another
+ * target before App.tsx can report that all three areas were refreshed.
+ */
+const bulkRefreshTargets = Object.entries(refreshableAreaContentTypes) as Array<
+  [RefreshableAreaId, string]
+>;
 
 // Array order controls both the sidebar and main review queue. Content type is
 // included in the lookup because one area may eventually store multiple
@@ -139,13 +195,6 @@ const areaDefinitions: AreaDefinition[] = [
     contentType: "weekly_workout_routine",
     name: "Health",
     description: "The next physical routines, kept specific and easy to start.",
-    accent: "iris",
-  },
-  {
-    id: "reading",
-    contentType: "reading_queue",
-    name: "Reading",
-    description: "News and research worth keeping, without becoming another feed.",
     accent: "iris",
   },
   {
@@ -182,9 +231,9 @@ function readOptionalString(value: unknown, field: string): string | undefined {
 /**
  * Converts the metadata beneath an entry title.
  *
- * Metadata is optional at the storage boundary because a simple reading item
- * may have no secondary details. The UI always receives an array, which lets
- * App.tsx render entries without null checks.
+ * Metadata is optional at the storage boundary because a simple task may have
+ * no secondary details. The UI always receives an array, which lets App.tsx
+ * render entries without null checks.
  */
 function readMetadata(value: unknown, entryLabel: string): EntryMetadata[] {
   if (value === undefined || value === null) return [];
@@ -208,7 +257,7 @@ function readMetadata(value: unknown, entryLabel: string): EntryMetadata[] {
   });
 }
 
-/** Converts one stored Home, Health, or Reading entry into the UI model. */
+/** Converts one stored Home or Health entry into the UI model. */
 function readReviewEntry(value: unknown, areaId: StoredAreaId, index: number): ReviewEntry {
   const entryLabel = `${areaId} entry ${index + 1}`;
   if (!isRecord(value)) {
@@ -230,7 +279,7 @@ function readReviewEntry(value: unknown, areaId: StoredAreaId, index: number): R
   };
 }
 
-/** Extracts the common `entries` array used by Home, Health, and Reading. */
+/** Extracts the common `entries` array used by Home and Health. */
 function readEntryDocument(content: unknown, areaId: StoredAreaId): ReviewEntry[] {
   if (!isRecord(content) || !Array.isArray(content.entries)) {
     throw new Error(`${areaId} content must contain an entries array.`);
@@ -364,6 +413,238 @@ function readWeeklyAreaUpdateResults(payload: unknown): WeeklyAreaUpdateResult[]
 }
 
 /**
+ * Verifies the full result set returned only by the bulk refresh endpoint.
+ *
+ * Each configured Home, Health, and Meals pair must appear exactly once. The
+ * status may be updated, skipped, or failed, but a structurally incomplete or
+ * duplicate response is unsafe because the page-level message could otherwise
+ * claim a full refresh while one visible area was never considered by Go.
+ */
+function readBulkRefreshResults(payload: unknown): WeeklyAreaUpdateResult[] {
+  const results = readWeeklyAreaUpdateResults(payload);
+  if (results.length !== bulkRefreshTargets.length) {
+    throw new Error("The bulk update API returned an unexpected result set.");
+  }
+
+  const expectedPairs = new Set(
+    bulkRefreshTargets.map(([areaId, contentType]) => `${areaId}:${contentType}`),
+  );
+  const receivedPairs = new Set<string>();
+
+  for (const result of results) {
+    const pair = `${result.areaId}:${result.contentType}`;
+    if (!expectedPairs.has(pair) || receivedPairs.has(pair)) {
+      throw new Error("The bulk update API returned an unexpected result set.");
+    }
+    receivedPairs.add(pair);
+  }
+
+  // The length and duplicate checks above make this defensive final comparison
+  // explicit: every expected pair is present once, not merely a same-length set.
+  if (receivedPairs.size !== expectedPairs.size) {
+    throw new Error("The bulk update API returned an unexpected result set.");
+  }
+
+  return results;
+}
+
+/**
+ * Validates the compact prompt object returned by the prompt GET and PUT routes.
+ *
+ * Prompt text may contain leading or trailing whitespace that a person entered
+ * intentionally, so this reader requires a string but does not trim the saved
+ * value. Blank values are rejected before a PUT is sent instead.
+ */
+function readAreaContentPrompt(
+  payload: unknown,
+  expectedAreaId: StoredAreaId,
+  expectedContentType: string,
+): AreaContentPrompt {
+  if (!isRecord(payload)) {
+    throw new Error("The area prompt API response must be an object.");
+  }
+
+  const areaId = readRequiredString(payload.area_id, "area prompt area_id");
+  const contentType = readRequiredString(payload.content_type, "area prompt content_type");
+  if (areaId !== expectedAreaId || contentType !== expectedContentType) {
+    throw new Error(`The ${expectedAreaId} prompt API returned an unexpected prompt.`);
+  }
+
+  if (typeof payload.prompt !== "string") {
+    throw new Error("Area prompt field prompt must be a string.");
+  }
+
+  return {
+    areaId: expectedAreaId,
+    contentType: expectedContentType,
+    prompt: payload.prompt,
+  };
+}
+
+/**
+ * Validates the complete response from an entry-state PUT.
+ *
+ * Every returned identity must match the request. This prevents an optimistic
+ * checkbox from remaining changed if a proxy, stale server, or malformed mock
+ * returns a valid object that actually describes another stored entry.
+ */
+function readAreaEntryStateUpdate(
+  payload: unknown,
+  expectedAreaId: PersistedEntryAreaId,
+  expectedContentType: string,
+  expectedEntryId: string,
+  expectedState: EntryState,
+): AreaEntryStateUpdate {
+  if (!isRecord(payload)) {
+    throw new Error("The entry state API response must be an object.");
+  }
+
+  const areaId = readRequiredString(payload.area_id, "entry state area_id");
+  const contentType = readRequiredString(payload.content_type, "entry state content_type");
+  const entryId = readRequiredString(payload.entry_id, "entry state entry_id");
+  const state = readRequiredString(payload.state, "entry state state");
+  if (
+    areaId !== expectedAreaId ||
+    contentType !== expectedContentType ||
+    entryId !== expectedEntryId ||
+    state !== expectedState
+  ) {
+    throw new Error(`The ${expectedAreaId} entry state API returned an unexpected entry.`);
+  }
+
+  if (typeof payload.revision !== "number" || !Number.isInteger(payload.revision)) {
+    throw new Error("Entry state field revision must be an integer.");
+  }
+
+  return {
+    areaId: expectedAreaId,
+    contentType: expectedContentType,
+    entryId: expectedEntryId,
+    state: expectedState,
+    revision: payload.revision,
+  };
+}
+
+/**
+ * Builds a prompt route from a visible area rather than exposing database field
+ * names to components. Encoding both dynamic segments keeps this safe if a
+ * future stored identifier contains a character with URL meaning.
+ */
+function areaPromptUrl(areaId: StoredAreaId): string {
+  const definition = areaDefinitions.find((candidate) => candidate.id === areaId);
+  if (!definition) {
+    // StoredAreaId and areaDefinitions are intentionally kept in the same file.
+    // This guard makes a future type or definition change fail clearly instead
+    // of sending an incomplete URL from an editor interaction.
+    throw new Error(`No content type is configured for ${areaId}.`);
+  }
+
+  return `/api/areas/${encodeURIComponent(areaId)}/${encodeURIComponent(definition.contentType)}/prompt`;
+}
+
+/**
+ * Loads one area's saved generation instructions for the prompt editor.
+ *
+ * A 404 is a normal blank-create state: the area has visible database content
+ * but no enabled prompt yet. All other non-success statuses remain errors so
+ * the dialog can distinguish a missing prompt from a connection or server
+ * problem and avoid overwriting the person's entered text.
+ */
+export async function fetchAreaContentPrompt(
+  areaId: StoredAreaId,
+  signal?: AbortSignal,
+): Promise<AreaContentPrompt | null> {
+  const response = await fetch(areaPromptUrl(areaId), {
+    headers: { Accept: "application/json" },
+    signal,
+  });
+
+  if (response.status === 404) return null;
+  if (!response.ok) {
+    throw new Error(`Unable to load ${areaId} prompt (HTTP ${response.status}).`);
+  }
+
+  const definition = areaDefinitions.find((candidate) => candidate.id === areaId);
+  if (!definition) throw new Error(`No content type is configured for ${areaId}.`);
+  return readAreaContentPrompt(await response.json(), areaId, definition.contentType);
+}
+
+/**
+ * Saves prompt instructions for a future manual or scheduled area refresh.
+ *
+ * This route only persists the prompt. It intentionally does not call an
+ * update endpoint or reload review data, preserving the entries already shown
+ * until a person explicitly chooses a Refresh action later.
+ */
+export async function saveAreaContentPrompt(
+  areaId: StoredAreaId,
+  prompt: string,
+  signal?: AbortSignal,
+): Promise<AreaContentPrompt> {
+  if (prompt.trim() === "") {
+    throw new Error("A prompt cannot be blank.");
+  }
+
+  const response = await fetch(areaPromptUrl(areaId), {
+    method: "PUT",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ prompt }),
+    signal,
+  });
+
+  if (!response.ok) {
+    throw new Error(`Unable to save ${areaId} prompt (HTTP ${response.status}).`);
+  }
+
+  const definition = areaDefinitions.find((candidate) => candidate.id === areaId);
+  if (!definition) throw new Error(`No content type is configured for ${areaId}.`);
+  return readAreaContentPrompt(await response.json(), areaId, definition.contentType);
+}
+
+/**
+ * Persists an optimistic Home or Health checkbox change.
+ *
+ * The component supplies only product-facing ids and the desired state. This
+ * helper owns the stored content type, URL encoding, request body, HTTP error,
+ * and response validation required by the Go entry-state contract.
+ */
+export async function saveAreaEntryState(
+  areaId: PersistedEntryAreaId,
+  entryId: string,
+  state: EntryState,
+  signal?: AbortSignal,
+): Promise<AreaEntryStateUpdate> {
+  const contentType = persistedEntryContentTypes[areaId];
+  const response = await fetch(
+    `/api/areas/${encodeURIComponent(areaId)}/${encodeURIComponent(contentType)}/entries/${encodeURIComponent(entryId)}/state`,
+    {
+      method: "PUT",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ state }),
+      signal,
+    },
+  );
+
+  if (!response.ok) {
+    throw new Error(`Unable to save ${areaId} entry state (HTTP ${response.status}).`);
+  }
+
+  return readAreaEntryStateUpdate(
+    await response.json(),
+    areaId,
+    contentType,
+    entryId,
+    state,
+  );
+}
+
+/**
  * Adapts the complete `/api/areas` payload into the domain model used by React.
  * Unknown documents are ignored until a display definition is intentionally
  * added above; this prevents a future backend-only document from appearing as
@@ -452,7 +733,7 @@ export async function fetchReviewAreas(signal?: AbortSignal): Promise<ReviewArea
 }
 
 /**
- * Regenerates the Health and Meals plans through the Go manual-update endpoint.
+ * Regenerates Home, Health, and Meals through the Go bulk-refresh endpoint.
  *
  * The request intentionally contains no prompt or existing content. Go loads
  * both from Supabase, calls OpenRouter, validates each replacement document,
@@ -472,30 +753,33 @@ export async function requestWeeklyAreaUpdate(
   }
 
   const payload: unknown = await response.json();
-  return readWeeklyAreaUpdateResults(payload);
+  return readBulkRefreshResults(payload);
 }
 
 /**
- * Regenerates one weekly plan after its Health or Meals section button is
- * clicked.
+ * Regenerates one configured area after its section Refresh button is clicked.
  *
- * For example, `"health"` becomes
+ * For example, `"home"` becomes
+ * `POST /api/areas/home/maintenance_tasks/update`; `"health"` becomes
  * `POST /api/areas/health/weekly_workout_routine/update`. The Go server then
  * loads only that document and prompt, waits for OpenRouter, validates and
  * saves the replacement, and finally returns a one-item result array.
  */
 export async function requestAreaContentUpdate(
-  areaId: WeeklyPlanAreaId,
+  areaId: RefreshableAreaId,
   signal?: AbortSignal,
 ): Promise<WeeklyAreaUpdateResult> {
   // Look up the backend content type here rather than asking the component to
   // know how database documents are named.
-  const contentType = weeklyPlanContentTypes[areaId];
-  const response = await fetch(`/api/areas/${areaId}/${contentType}/update`, {
-    method: "POST",
-    headers: { Accept: "application/json" },
-    signal,
-  });
+  const contentType = refreshableAreaContentTypes[areaId];
+  const response = await fetch(
+    `/api/areas/${encodeURIComponent(areaId)}/${encodeURIComponent(contentType)}/update`,
+    {
+      method: "POST",
+      headers: { Accept: "application/json" },
+      signal,
+    },
+  );
 
   if (!response.ok) {
     throw new Error(`Unable to update ${areaId} plan (HTTP ${response.status}).`);
