@@ -41,9 +41,12 @@ system and its current boundaries.
 Collect the final text from the three existing GPT-5.5 Pi review panes once the
 Herdr approval service permits another read, then visually check the Health
 section through Vite on desktop and mobile. Confirm each exercise has its own
-bullet and that a simple single-sentence recovery day remains a paragraph.
+bullet and that a simple single-sentence recovery day remains a paragraph. The
+pushed feature branch can then be opened as a pull request or merged through the
+repository's normal workflow.
 
-No commit has been created for this work.
+The implementation was committed as `65b9444` on
+`feat/configurable-area-refresh` and pushed to `origin` on 2026-08-20.
 
 ## Start the application
 
@@ -100,6 +103,7 @@ An ignored local file named `Persona-ai-v3 creds.txt` exists at the repository
 root. It was not opened. Do not inspect, stage, or commit it without explicit
 approval.
 
-The branch is `main`; the current HEAD remains `6de407c` (`Prepare Cloud Run
-deployment`, 2026-07-30). The worktree contains other pre-existing user changes,
-so review and stage files selectively.
+The working branch is `feat/configurable-area-refresh`; it was created from
+`main` at `6de407c` (`Prepare Cloud Run deployment`, 2026-07-30). The worktree
+may still display WSL metadata-only status entries even when `git diff` contains
+no unstaged content, so review and stage paths selectively.
