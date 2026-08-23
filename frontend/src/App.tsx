@@ -17,6 +17,7 @@ import {
   CheckCircle,
   EnvelopeSimple,
   ForkKnife,
+  Heart,
   Heartbeat,
   HouseLine,
   ListChecks,
@@ -27,15 +28,24 @@ import {
   X,
 } from "@phosphor-icons/react";
 import {
+  addThoughtfulFavorite,
   fetchAreaContentPrompt,
   fetchReviewAreaSnapshot,
+  removeThoughtfulFavorite,
   requestAreaContentUpdate,
   requestWeeklyAreaUpdate,
   saveAreaContentPrompt,
   saveAreaEntryState,
 } from "./data/areaContentApi";
 import type { PersistedEntryAreaId, RefreshableAreaId } from "./data/areaContentApi";
-import type { AreaId, EntryState, QueueFilter, ReviewArea } from "./domain/review";
+import type {
+  AreaId,
+  EntryState,
+  QueueFilter,
+  ReviewArea,
+  ThoughtfulFavorite,
+  ThoughtfulSuggestionsContent,
+} from "./domain/review";
 
 /** The three visible phases of the initial `/api/areas` request. */
 type AreaLoadState = "loading" | "ready" | "error";
@@ -187,6 +197,8 @@ function AreaGlyph({ areaId, size = 19 }: { areaId: AreaId; size?: number }) {
       return <NewspaperClipping {...props} />;
     case "meals":
       return <ForkKnife {...props} />;
+    case "thoughtful":
+      return <Heart {...props} />;
     case "money":
       return <Wallet {...props} />;
   }
@@ -256,6 +268,14 @@ export default function ReviewApp() {
   const [savingEntryKeys, setSavingEntryKeys] = useState<Set<string>>(() => new Set());
   const savingEntryKeysRef = useRef<Set<string>>(new Set());
 
+  // Thoughtful Favorites share one document revision, unlike Home and Health
+  // entry states. A single page-wide lock therefore prevents an add on one
+  // card and a remove on another from both sending the same stale revision.
+  // The ref closes the short double-click window before React paints disabled
+  // hearts; the state makes that locked condition visible and accessible.
+  const [thoughtfulFavoriteMutationRunning, setThoughtfulFavoriteMutationRunning] = useState(false);
+  const thoughtfulFavoriteMutationRunningRef = useRef(false);
+
   // Area selection, text search, and the Open/All/Completed filter are stored
   // separately. A person can therefore combine them—for example, show only
   // completed Mail entries whose text contains "Google".
@@ -281,6 +301,12 @@ export default function ReviewApp() {
   const promptEditTriggerRef = useRef<HTMLButtonElement>(null);
   const restorePromptFocusRef = useRef(false);
   const promptRequestControllerRef = useRef<AbortController | null>(null);
+
+  // The Favorites heading remains mounted when a Favorite card is removed.
+  // Giving it a programmatic focus target lets keyboard focus land somewhere
+  // stable instead of falling back to the document body after React removes
+  // the activated card from the DOM.
+  const thoughtfulFavoritesHeadingRef = useRef<HTMLHeadingElement>(null);
 
   // Skipped update results start an unobtrusive snapshot check after a delay.
   // A run number prevents an older timer or response from replacing a newer
@@ -365,16 +391,17 @@ export default function ReviewApp() {
   const normalizedQuery = query.trim().toLocaleLowerCase();
 
   // Filtering happens in three steps: keep the selected area (or every area),
-  // keep only entries matching the status and search text, then remove any area
-  // group left with no visible entries. The complete `areas` state is retained,
-  // so clearing the controls can show everything again.
+  // filter task entries by status and text, then remove empty groups. Thoughtful
+  // cards are browse-and-save content rather than tasks, so status never changes
+  // them; text still searches their visible title, details, category, and saved
+  // date. The complete `areas` state is retained, so clearing controls restores
+  // every card in its server-provided order.
   const visibleAreas = useMemo(
     () =>
       areas
         .filter((area) => !activeArea || area.id === activeArea)
-        .map((area) => ({
-          ...area,
-          entries: area.entries.filter((entry) => {
+        .map((area) => {
+          const entries = area.entries.filter((entry) => {
             const matchesState = filter === "all" || entry.state === filter;
 
             // Search both primary prose and structured metadata so a person can
@@ -387,9 +414,37 @@ export default function ReviewApp() {
               .join(" ")
               .toLocaleLowerCase();
             return matchesState && (!normalizedQuery || searchableText.includes(normalizedQuery));
-          }),
-        }))
-        .filter((area) => area.entries.length > 0),
+          });
+
+          if (!area.thoughtfulSuggestions) return { ...area, entries };
+
+          // A Favorite deliberately keeps its saved date in search. That lets a
+          // person find an older saved gesture by the day they remember using it.
+          const matchesThoughtfulSearch = (card: {
+            title: string;
+            details: string;
+            category: string;
+            savedAt?: string;
+          }) =>
+            !normalizedQuery ||
+            [card.title, card.details, card.category, card.savedAt ?? ""]
+              .join(" ")
+              .toLocaleLowerCase()
+              .includes(normalizedQuery);
+          const thoughtfulSuggestions = {
+            ...area.thoughtfulSuggestions,
+            suggestions: area.thoughtfulSuggestions.suggestions.filter(matchesThoughtfulSearch),
+            favorites: area.thoughtfulSuggestions.favorites.filter(matchesThoughtfulSearch),
+          };
+          return { ...area, entries, thoughtfulSuggestions };
+        })
+        .filter(
+          (area) =>
+            area.entries.length > 0 ||
+            (area.thoughtfulSuggestions !== undefined &&
+              (area.thoughtfulSuggestions.suggestions.length > 0 ||
+                area.thoughtfulSuggestions.favorites.length > 0)),
+        ),
     [activeArea, areas, filter, normalizedQuery],
   );
 
@@ -1060,6 +1115,177 @@ export default function ReviewApp() {
     }
   }
 
+  /**
+   * Saves or removes one Thoughtful Favorite from a heart button.
+   *
+   * An empty weekly heart adds its source as a Favorite; a filled weekly heart
+   * and a Favorite's own heart both remove the durable Favorite. The handler
+   * captures the exact Thoughtful content and revision before its optimistic
+   * edit. If Go rejects the conditional write, a fresh snapshot wins; only if
+   * that GET also fails do we put this captured content back for a safe retry.
+   */
+  async function toggleThoughtfulFavorite(
+    sourceSuggestionId: string,
+    favoriteId?: string,
+    trigger?: HTMLButtonElement,
+    focusTarget?: HTMLElement,
+  ) {
+    // The rendered disabled state is useful feedback, but React applies it on
+    // the next render. Set this ref first so two rapid clicks, including on two
+    // different cards, cannot issue concurrent writes against one revision.
+    if (thoughtfulFavoriteMutationRunningRef.current) return;
+
+    const thoughtfulArea = areas.find((area) => area.id === "thoughtful");
+    const previousContent = thoughtfulArea?.thoughtfulSuggestions;
+    if (!thoughtfulArea || !previousContent) return;
+
+    const sourceSuggestion = previousContent.suggestions.find(
+      (suggestion) => suggestion.id === sourceSuggestionId,
+    );
+    const durableFavorite = favoriteId
+      ? previousContent.favorites.find((favorite) => favorite.id === favoriteId)
+      : previousContent.favorites.find((favorite) => favorite.sourceSuggestionId === sourceSuggestionId);
+    const isRemoving = durableFavorite !== undefined;
+    if (!isRemoving && !sourceSuggestion) return;
+
+    // Copy the current content before the optimistic state update. Objects from
+    // the adapter are never mutated, so this remains an exact rollback value.
+    const priorThoughtfulContent: ThoughtfulSuggestionsContent = previousContent;
+    thoughtfulFavoriteMutationRunningRef.current = true;
+    setThoughtfulFavoriteMutationRunning(true);
+
+    if (isRemoving) {
+      // A Favorite-card heart disappears with its card, so move focus before
+      // the optimistic render removes that button. Weekly hearts stay mounted
+      // after a remove and deliberately keep their ordinary button focus.
+      if (trigger && focusTarget && document.activeElement === trigger) {
+        focusTarget.focus();
+      }
+
+      // Removing a Favorite immediately unfills the matching weekly heart and
+      // removes its saved card. The server response supplies only a new revision.
+      setAreas((currentAreas) =>
+        currentAreas.map((area) =>
+          area.id !== "thoughtful" || !area.thoughtfulSuggestions
+            ? area
+            : {
+                ...area,
+                thoughtfulSuggestions: {
+                  ...area.thoughtfulSuggestions,
+                  favorites: area.thoughtfulSuggestions.favorites.filter(
+                    (favorite) => favorite.id !== durableFavorite.id,
+                  ),
+                },
+              },
+        ),
+      );
+    } else {
+      // The temporary id exists only until PUT returns the server-owned durable
+      // Favorite. Prepending follows the backend's newest-first Favorite order.
+      // The guard above guarantees a source for this add-only branch. A remove
+      // may legitimately target an older Favorite whose weekly source expired.
+      const source = sourceSuggestion!;
+      const optimisticFavorite: ThoughtfulFavorite = {
+        id: `optimistic-${source.id}`,
+        sourceSuggestionId: source.id,
+        title: source.title,
+        details: source.details,
+        category: source.category,
+        savedAt: new Date().toISOString().slice(0, 10),
+      };
+      setAreas((currentAreas) =>
+        currentAreas.map((area) =>
+          area.id !== "thoughtful" || !area.thoughtfulSuggestions
+            ? area
+            : {
+                ...area,
+                thoughtfulSuggestions: {
+                  ...area.thoughtfulSuggestions,
+                  favorites: [optimisticFavorite, ...area.thoughtfulSuggestions.favorites],
+                },
+              },
+        ),
+      );
+    }
+
+    try {
+      const result = isRemoving
+        ? await removeThoughtfulFavorite(durableFavorite.id, priorThoughtfulContent.revision)
+        : await addThoughtfulFavorite(sourceSuggestion!.id, priorThoughtfulContent.revision);
+
+      setAreas((currentAreas) =>
+        currentAreas.map((area) => {
+          if (area.id !== "thoughtful" || !area.thoughtfulSuggestions) return area;
+
+          const nextContent = {
+            ...area.thoughtfulSuggestions,
+            revision: result.revision,
+          };
+          if (isRemoving) {
+            // A concurrent whole-snapshot reload may have reintroduced the
+            // Favorite while DELETE was pending. The successful mutation wins,
+            // so remove that durable id from whatever content is current now.
+            return {
+              ...area,
+              thoughtfulSuggestions: {
+                ...nextContent,
+                favorites: nextContent.favorites.filter(
+                  (favorite) => favorite.id !== durableFavorite.id,
+                ),
+              },
+            };
+          }
+
+          // A concurrent reload may have removed the optimistic record entirely
+          // or reintroduced an older copy. Upsert by source id so the returned
+          // Favorite is present exactly once with every server-confirmed field.
+          return {
+            ...area,
+            thoughtfulSuggestions: {
+              ...nextContent,
+              favorites: [
+                result.favorite,
+                ...nextContent.favorites.filter(
+                  (favorite) => favorite.sourceSuggestionId !== result.favorite.sourceSuggestionId,
+                ),
+              ],
+            },
+          };
+        }),
+      );
+      setAnnouncement(
+        isRemoving
+          ? `Removed ${durableFavorite.title} from Favorites.`
+          : `Saved ${sourceSuggestion!.title} to Favorites.`,
+      );
+    } catch {
+      try {
+        // A conflict is not safely recoverable from local assumptions. Reloading
+        // both content and timestamps keeps the page's next revision aligned
+        // with the authoritative document before the person tries another heart.
+        const snapshot = await fetchReviewAreaSnapshot();
+        setAreas(snapshot.areas);
+        setUpdatedAtByArea(snapshot.updatedAtByArea);
+        setAnnouncement("Could not save that Favorite change. The latest saved Favorites are shown.");
+      } catch {
+        // A second network failure must not leave an optimistic card pretending
+        // to be durable. Restore only Thoughtful so unrelated local task work
+        // and any newer timestamp map from a concurrent reload are preserved.
+        setAreas((currentAreas) =>
+          currentAreas.map((area) =>
+            area.id === "thoughtful"
+              ? { ...area, thoughtfulSuggestions: priorThoughtfulContent }
+              : area,
+          ),
+        );
+        setAnnouncement("Could not save that Favorite change. Your previous Favorites were restored.");
+      }
+    } finally {
+      thoughtfulFavoriteMutationRunningRef.current = false;
+      setThoughtfulFavoriteMutationRunning(false);
+    }
+  }
+
   return (
     <div className="app-frame">
       {/* This dark overlay behind the mobile sidebar is called `nav-scrim`.
@@ -1123,7 +1349,9 @@ export default function ReviewApp() {
           <p className="nav-label area-label">Areas</p>
           {areas.map((area) => {
             // Sidebar counts intentionally ignore the active content filter and
-            // always answer the stable question: how much remains open here?
+            // always answer the stable question: how much remains open here.
+            // Thoughtful has no open/done work, so omitting its count avoids
+            // wrongly presenting its browse-and-save cards as "0 open" tasks.
             const areaOpenCount = area.entries.filter((entry) => entry.state === "open").length;
             return (
               <button
@@ -1134,7 +1362,7 @@ export default function ReviewApp() {
               >
                 <span className={`nav-icon accent-${area.accent}`}><AreaGlyph areaId={area.id} /></span>
                 <span>{area.name}</span>
-                <span className="nav-count">{areaOpenCount}</span>
+                {area.id !== "thoughtful" && <span className="nav-count">{areaOpenCount}</span>}
               </button>
             );
           })}
@@ -1170,11 +1398,13 @@ export default function ReviewApp() {
               <h1>{activeAreaName ? `${activeAreaName}, at a glance.` : "What needs your attention."}</h1>
               <p className="page-summary">
                 {areaLoadState === "loading"
-                  ? "Loading your current Home, Health, and Meals review."
+                  ? "Loading your current Home, Health, Meals, and Thoughtful Suggestions review."
                   : areaLoadState === "error"
                     ? "Your saved review data could not be loaded. You can retry below."
                     : activeAreaName
-                      ? `A focused view of the open work in ${activeAreaName.toLocaleLowerCase()}.`
+                      ? activeArea === "thoughtful"
+                        ? "A focused view for browsing this week's caring ideas and saving Favorites."
+                        : `A focused view of the open work in ${activeAreaName.toLocaleLowerCase()}.`
                       : `${openCount} entries are open across ${openAreaCount} ${openAreaCount === 1 ? "area" : "areas"}. Start at the top or choose an area.`}
               </p>
             </div>
@@ -1270,8 +1500,19 @@ export default function ReviewApp() {
               visibleAreas.map((area) => {
                 // This count describes the currently visible copy in open mode;
                 // other filters switch the label to a neutral "shown" count.
+                // Thoughtful instead names its Favorites because its cards are
+                // deliberately outside the task completion model.
                 const areaOpenCount = area.entries.filter((entry) => entry.state === "open").length;
                 const areaUpdatedAt = updatedAtByArea[area.id];
+                const thoughtfulContent = area.thoughtfulSuggestions;
+                // `area` comes from `visibleAreas`, so its Favorites may have
+                // been removed by the search query. Weekly heart state must
+                // still use the complete Favorites list from `areas`; otherwise
+                // a visible weekly idea can look unsaved merely because the
+                // saved card's title or details do not match the query.
+                const unfilteredThoughtfulContent = areas.find(
+                  (candidate) => candidate.id === area.id,
+                )?.thoughtfulSuggestions;
 
                 // Mail and Money are fixture-only review areas. Home, Health,
                 // and Meals are backed by the configured API, so every rendered
@@ -1300,7 +1541,11 @@ export default function ReviewApp() {
                         <div className="area-title-line">
                           <h2 id={`area-${area.id}`}>{area.name}</h2>
                           <span className="area-count">
-                            {filter === "open" ? `${areaOpenCount} open` : `${area.entries.length} shown`}
+                            {thoughtfulContent
+                              ? `${thoughtfulContent.favorites.length} ${thoughtfulContent.favorites.length === 1 ? "Favorite" : "Favorites"}`
+                              : filter === "open"
+                                ? `${areaOpenCount} open`
+                                : `${area.entries.length} shown`}
                           </span>
                         </div>
                         <p>{area.description}</p>
@@ -1362,8 +1607,96 @@ export default function ReviewApp() {
                       )}
                     </div>
 
-                    <div className="entry-list">
-                      {area.entries.map((entry) => {
+                    {thoughtfulContent ? (
+                      /* Thoughtful cards are semantically separate from task rows:
+                         neither weekly ideas nor Favorites receive check controls,
+                         and their headings make the browse-and-save grouping clear. */
+                      <div className="thoughtful-content">
+                        <section className="thoughtful-region" aria-labelledby={`thoughtful-week-${area.id}`}>
+                          <h3 id={`thoughtful-week-${area.id}`}>This Week</h3>
+                          {thoughtfulContent.suggestions.map((suggestion) => {
+                            const favorite = unfilteredThoughtfulContent?.favorites.find(
+                              (candidate) => candidate.sourceSuggestionId === suggestion.id,
+                            );
+                            const isFavorite = favorite !== undefined;
+                            return (
+                              <article className="thoughtful-card thoughtful-suggestion-card" key={suggestion.id}>
+                                <div className="thoughtful-card-copy">
+                                  <h4>{suggestion.title}</h4>
+                                  <p>{suggestion.details}</p>
+                                  <p className="thoughtful-category"><b>Category</b> {suggestion.category}</p>
+                                </div>
+                                <button
+                                  className="thoughtful-favorite-action"
+                                  type="button"
+                                  onClick={(event) =>
+                                    void toggleThoughtfulFavorite(
+                                      suggestion.id,
+                                      favorite?.id,
+                                      event.currentTarget,
+                                    )
+                                  }
+                                  disabled={thoughtfulFavoriteMutationRunning}
+                                  aria-pressed={isFavorite}
+                                  aria-busy={thoughtfulFavoriteMutationRunning}
+                                  aria-label={`${isFavorite ? "Remove" : "Add"} ${suggestion.title} ${isFavorite ? "from" : "to"} Favorites`}
+                                >
+                                  <Heart size={20} weight={isFavorite ? "fill" : "regular"} aria-hidden="true" />
+                                </button>
+                              </article>
+                            );
+                          })}
+                        </section>
+
+                        <section className="thoughtful-region thoughtful-favorites-region" aria-labelledby={`thoughtful-favorites-${area.id}`}>
+                          <h3
+                            id={`thoughtful-favorites-${area.id}`}
+                            ref={thoughtfulFavoritesHeadingRef}
+                            tabIndex={-1}
+                          >
+                            Favorites
+                          </h3>
+                          {thoughtfulContent.favorites.length > 0 ? (
+                            thoughtfulContent.favorites.map((favorite) => (
+                              <article className="thoughtful-card thoughtful-favorite-card" key={favorite.id}>
+                                <div className="thoughtful-card-copy">
+                                  <h4>{favorite.title}</h4>
+                                  <p>{favorite.details}</p>
+                                  <p className="thoughtful-category"><b>Category</b> {favorite.category}</p>
+                                  <p className="thoughtful-saved-at"><b>Saved</b> <time dateTime={favorite.savedAt}>{favorite.savedAt}</time></p>
+                                </div>
+                                <button
+                                  className="thoughtful-favorite-action"
+                                  type="button"
+                                  onClick={(event) =>
+                                    void toggleThoughtfulFavorite(
+                                      favorite.sourceSuggestionId,
+                                      favorite.id,
+                                      event.currentTarget,
+                                      thoughtfulFavoritesHeadingRef.current ?? undefined,
+                                    )
+                                  }
+                                  disabled={thoughtfulFavoriteMutationRunning}
+                                  aria-pressed="true"
+                                  aria-busy={thoughtfulFavoriteMutationRunning}
+                                  aria-label={`Remove ${favorite.title} from Favorites`}
+                                >
+                                  <Heart size={20} weight="fill" aria-hidden="true" />
+                                </button>
+                              </article>
+                            ))
+                          ) : (
+                            <p className="thoughtful-empty-favorites">
+                              {normalizedQuery
+                                ? "No saved suggestions match this search."
+                                : "Save a suggestion from This Week to keep it in Favorites."}
+                            </p>
+                          )}
+                        </section>
+                      </div>
+                    ) : (
+                      <div className="entry-list">
+                        {area.entries.map((entry) => {
                         // Only Health interprets separators as workout boundaries.
                         // Mail summaries, Home instructions, and meal descriptions
                         // keep their original prose even if they contain line breaks.
@@ -1435,8 +1768,9 @@ export default function ReviewApp() {
                             )}
                           </article>
                         );
-                      })}
-                    </div>
+                        })}
+                      </div>
+                    )}
                   </section>
                 );
               })

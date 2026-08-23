@@ -2,10 +2,11 @@
  * The frontend boundary for area content loaded from the Go API.
  *
  * Supabase stores independently shaped JSON documents: Home and Health contain
- * ordinary review entries, while Meals contains weekly meal recommendations.
- * This module translates both database shapes into the one `ReviewArea` model
- * rendered by App.tsx. Components therefore do not need to know table names,
- * content types, or meal-specific database fields.
+ * ordinary review entries, Meals contains weekly meal recommendations, and
+ * Thoughtful Suggestions contains separate weekly ideas and durable Favorites.
+ * This module translates those stored shapes into the `ReviewArea` model
+ * rendered by App.tsx. Components therefore do not need database field names
+ * or to decide which records are task-like.
  *
  * The complete loading sequence is:
  *
@@ -34,7 +35,11 @@
  *    That function turns each recommendation into a `ReviewEntry`, creates a
  *    stable id from its weekday with `mealEntryId`, and presents its day and
  *    tags as searchable metadata.
- * 8. `adaptAreaContents` combines the translated entries with the frontend-owned
+ * 8. Thoughtful Suggestions follows `readThoughtfulSuggestionsContent`, which
+ *    preserves its five ideas and Favorites as specialized content with no
+ *    invented open/done state. Only Home, Health, and Meals remain refreshable
+ *    while Go's updater has no Thoughtful registration.
+ * 9. `adaptAreaContents` combines the translated entries with the frontend-owned
  *    name, description, accent, and order from `areaDefinitions`, then returns
  *    `ReviewArea[]` to `fetchReviewAreas`. The caller can store that final array
  *    in React state and render it without understanding any database schemas.
@@ -51,16 +56,25 @@ import type {
   EntryState,
   ReviewArea,
   ReviewEntry,
+  ThoughtfulFavorite,
+  ThoughtfulSuggestion,
+  ThoughtfulSuggestionsContent,
 } from "../domain/review";
 
-/** The three database-backed areas currently shown by the Review screen. */
+/** The three displayed areas whose prompt and refresh routes Go currently registers. */
 export type RefreshableAreaId = "home" | "health" | "meals";
 
 /** Areas whose individual entry state is stored by the current backend contract. */
 export type PersistedEntryAreaId = "home" | "health";
 
-/** Internal name for the same persisted-area union used by data adapters. */
-type StoredAreaId = RefreshableAreaId;
+/**
+ * Documents the Review screen can display, including Thoughtful Suggestions.
+ *
+ * This is intentionally wider than `RefreshableAreaId`: Go's updater does not
+ * register Thoughtful yet, so display support must not make its prompt or
+ * refresh routes callable from the existing controls.
+ */
+type StoredAreaId = RefreshableAreaId | "thoughtful";
 
 /**
  * One saved generation prompt owned by the database.
@@ -71,7 +85,7 @@ type StoredAreaId = RefreshableAreaId;
  * replaces the entries currently visible on the Review screen.
  */
 export interface AreaContentPrompt {
-  areaId: StoredAreaId;
+  areaId: RefreshableAreaId;
   contentType: string;
   prompt: string;
 }
@@ -91,6 +105,20 @@ export interface AreaEntryStateUpdate {
   revision: number;
 }
 
+/**
+ * The confirmed Favorite returned after a Thoughtful Suggestions PUT or DELETE.
+ *
+ * The Favorite is complete so a future component can update its saved list
+ * without recreating text locally. `revision` is the new document version that
+ * must be used by a following heart action to avoid overwriting another change.
+ */
+export interface ThoughtfulFavoriteMutation {
+  areaId: "thoughtful";
+  contentType: "weekly_thoughtful_suggestions";
+  favorite: ThoughtfulFavorite;
+  revision: number;
+}
+
 /** Display information stays in the frontend rather than being repeated in every database row. */
 interface AreaDefinition {
   id: StoredAreaId;
@@ -105,6 +133,7 @@ interface AreaContentDocument {
   areaId: string;
   contentType: string;
   content: unknown;
+  revision: unknown;
   updatedAt: string;
 }
 
@@ -204,6 +233,13 @@ const areaDefinitions: AreaDefinition[] = [
     description: "Meal recommendations for the week, ready when it is time to plan or shop.",
     accent: "saffron",
   },
+  {
+    id: "thoughtful",
+    contentType: "weekly_thoughtful_suggestions",
+    name: "Thoughtful Suggestions",
+    description: "Small, caring gestures for this week and the favorites worth keeping.",
+    accent: "rose",
+  },
 ];
 
 /** Returns true for JSON objects while excluding arrays and null. */
@@ -226,6 +262,51 @@ function readOptionalString(value: unknown, field: string): string | undefined {
     throw new Error(`Area content field ${field} must be a string when provided.`);
   }
   return value;
+}
+
+/** Reads a database revision that can safely participate in conditional writes. */
+function readPositiveInteger(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+    throw new Error(`${field} must be a positive integer.`);
+  }
+  return value;
+}
+
+/**
+ * Requires the exact calendar-only date form used by Thoughtful Suggestions.
+ *
+ * `Date.parse` accepts several partial or normalized forms, so the regular
+ * expression and UTC round-trip together reject values such as `2026-2-01` and
+ * `2026-02-30` before they reach a date label in React.
+ */
+function readIsoDate(value: unknown, field: string): string {
+  const date = readRequiredString(value, field);
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date);
+  if (!match) {
+    throw new Error(`${field} must be an exact YYYY-MM-DD date.`);
+  }
+
+  const parsed = new Date(`${date}T00:00:00.000Z`);
+  if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== date) {
+    throw new Error(`${field} must be an exact YYYY-MM-DD date.`);
+  }
+  return date;
+}
+
+/**
+ * Reads the Sunday that starts a generated Thoughtful week.
+ *
+ * Favorites use `readIsoDate` alone because people can save them on any day.
+ * The weekly document is different: Go anchors its generated five-card set to
+ * Sunday, so matching that rule keeps the frontend from labeling a malformed
+ * Monday-starting document as a valid planning week.
+ */
+function readThoughtfulWeekStarting(value: unknown): string {
+  const weekStarting = readIsoDate(value, "thoughtful week_starting");
+  if (new Date(`${weekStarting}T00:00:00.000Z`).getUTCDay() !== 0) {
+    throw new Error("thoughtful week_starting must be a Sunday.");
+  }
+  return weekStarting;
 }
 
 /**
@@ -339,6 +420,100 @@ function readMealRecommendations(content: unknown): ReviewEntry[] {
   });
 }
 
+/** Converts one server-owned Thoughtful item while preserving its stored text exactly. */
+function readThoughtfulSuggestion(value: unknown, label: string): ThoughtfulSuggestion {
+  if (!isRecord(value)) {
+    throw new Error(`${label} must be an object.`);
+  }
+
+  const id = readRequiredString(value.id, `${label}.id`);
+  if (id !== id.trim()) {
+    throw new Error(`${label}.id must not have leading or trailing whitespace.`);
+  }
+
+  return {
+    id,
+    title: readRequiredString(value.title, `${label}.title`),
+    details: readRequiredString(value.details, `${label}.details`),
+    category: readRequiredString(value.category, `${label}.category`),
+  };
+}
+
+/** Reads a durable Favorite's snake_case fields into its separate domain shape. */
+function readThoughtfulFavorite(value: unknown, label: string): ThoughtfulFavorite {
+  if (!isRecord(value)) {
+    throw new Error(`${label} must be an object.`);
+  }
+
+  const id = readRequiredString(value.id, `${label}.id`);
+  const sourceSuggestionId = readRequiredString(value.source_suggestion_id, `${label}.source_suggestion_id`);
+  if (id !== id.trim() || sourceSuggestionId !== sourceSuggestionId.trim()) {
+    throw new Error(`${label} identifiers must not have leading or trailing whitespace.`);
+  }
+
+  return {
+    id,
+    sourceSuggestionId,
+    title: readRequiredString(value.title, `${label}.title`),
+    details: readRequiredString(value.details, `${label}.details`),
+    category: readRequiredString(value.category, `${label}.category`),
+    savedAt: readIsoDate(value.saved_at, `${label}.saved_at`),
+  };
+}
+
+/**
+ * Translates the specialized weekly Thoughtful document without assigning task state.
+ *
+ * Suggestions and Favorites are browse-and-save records, not review entries;
+ * keeping them out of `entries` prevents the current Review UI from inventing
+ * open/done checkboxes or completion counts for personal gestures.
+ */
+function readThoughtfulSuggestionsContent(
+  content: unknown,
+  revision: unknown,
+): ThoughtfulSuggestionsContent {
+  if (!isRecord(content) || !Array.isArray(content.suggestions) || !Array.isArray(content.favorites)) {
+    throw new Error("thoughtful content must contain suggestions and favorites arrays.");
+  }
+  if (content.suggestions.length !== 5) {
+    throw new Error("thoughtful content must contain exactly five suggestions.");
+  }
+
+  const suggestions = content.suggestions.map((value, index) =>
+    readThoughtfulSuggestion(value, `thoughtful suggestion ${index + 1}`),
+  );
+  const favorites = content.favorites.map((value, index) =>
+    readThoughtfulFavorite(value, `thoughtful favorite ${index + 1}`),
+  );
+  const suggestionIds = new Set<string>();
+  const favoriteIds = new Set<string>();
+  const favoriteSourceIds = new Set<string>();
+
+  for (const suggestion of suggestions) {
+    if (suggestionIds.has(suggestion.id)) {
+      throw new Error("thoughtful content must not repeat suggestion ids.");
+    }
+    suggestionIds.add(suggestion.id);
+  }
+  for (const favorite of favorites) {
+    if (favoriteIds.has(favorite.id) || suggestionIds.has(favorite.id)) {
+      throw new Error("thoughtful content must not repeat durable favorite ids.");
+    }
+    if (favoriteSourceIds.has(favorite.sourceSuggestionId)) {
+      throw new Error("thoughtful content must not repeat favorite source suggestion ids.");
+    }
+    favoriteIds.add(favorite.id);
+    favoriteSourceIds.add(favorite.sourceSuggestionId);
+  }
+
+  return {
+    weekStarting: readThoughtfulWeekStarting(content.week_starting),
+    suggestions,
+    favorites,
+    revision: readPositiveInteger(revision, "thoughtful revision"),
+  };
+}
+
 /** Converts the snake_case JSON fields returned by Go into a small internal row type. */
 function readAreaContentDocument(value: unknown, index: number): AreaContentDocument {
   if (!isRecord(value)) {
@@ -354,6 +529,7 @@ function readAreaContentDocument(value: unknown, index: number): AreaContentDocu
     areaId: readRequiredString(value.area_id, `row ${index + 1}.area_id`),
     contentType: readRequiredString(value.content_type, `row ${index + 1}.content_type`),
     content: value.content,
+    revision: value.revision,
     updatedAt,
   };
 }
@@ -457,7 +633,7 @@ function readBulkRefreshResults(payload: unknown): WeeklyAreaUpdateResult[] {
  */
 function readAreaContentPrompt(
   payload: unknown,
-  expectedAreaId: StoredAreaId,
+  expectedAreaId: RefreshableAreaId,
   expectedContentType: string,
 ): AreaContentPrompt {
   if (!isRecord(payload)) {
@@ -530,7 +706,7 @@ function readAreaEntryStateUpdate(
  * names to components. Encoding both dynamic segments keeps this safe if a
  * future stored identifier contains a character with URL meaning.
  */
-function areaPromptUrl(areaId: StoredAreaId): string {
+function areaPromptUrl(areaId: RefreshableAreaId): string {
   const definition = areaDefinitions.find((candidate) => candidate.id === areaId);
   if (!definition) {
     // StoredAreaId and areaDefinitions are intentionally kept in the same file.
@@ -551,7 +727,7 @@ function areaPromptUrl(areaId: StoredAreaId): string {
  * problem and avoid overwriting the person's entered text.
  */
 export async function fetchAreaContentPrompt(
-  areaId: StoredAreaId,
+  areaId: RefreshableAreaId,
   signal?: AbortSignal,
 ): Promise<AreaContentPrompt | null> {
   const response = await fetch(areaPromptUrl(areaId), {
@@ -577,7 +753,7 @@ export async function fetchAreaContentPrompt(
  * until a person explicitly chooses a Refresh action later.
  */
 export async function saveAreaContentPrompt(
-  areaId: StoredAreaId,
+  areaId: RefreshableAreaId,
   prompt: string,
   signal?: AbortSignal,
 ): Promise<AreaContentPrompt> {
@@ -644,6 +820,124 @@ export async function saveAreaEntryState(
   );
 }
 
+/** The fixed stored identity accepted by the two Thoughtful Favorite routes. */
+const thoughtfulAreaId = "thoughtful" as const;
+const thoughtfulContentType = "weekly_thoughtful_suggestions" as const;
+
+/**
+ * Validates the complete mutation response before a heart can update local UI.
+ *
+ * PUT identifies a weekly source while DELETE identifies a durable Favorite,
+ * so the caller supplies the matching identity field. Requiring it here rejects
+ * a syntactically valid response for another card rather than silently changing
+ * the wrong heart after a proxy or stale response mix-up.
+ */
+function readThoughtfulFavoriteMutation(
+  payload: unknown,
+  expectedFavorite: Partial<Pick<ThoughtfulFavorite, "id" | "sourceSuggestionId">>,
+): ThoughtfulFavoriteMutation {
+  if (!isRecord(payload)) {
+    throw new Error("The thoughtful favorite API response must be an object.");
+  }
+
+  const areaId = readRequiredString(payload.area_id, "thoughtful favorite area_id");
+  const contentType = readRequiredString(payload.content_type, "thoughtful favorite content_type");
+  if (areaId !== thoughtfulAreaId || contentType !== thoughtfulContentType) {
+    throw new Error("The thoughtful favorite API returned an unexpected area.");
+  }
+
+  const favorite = readThoughtfulFavorite(payload.favorite, "thoughtful favorite response");
+  if (
+    (expectedFavorite.id !== undefined && favorite.id !== expectedFavorite.id) ||
+    (expectedFavorite.sourceSuggestionId !== undefined &&
+      favorite.sourceSuggestionId !== expectedFavorite.sourceSuggestionId)
+  ) {
+    throw new Error("The thoughtful favorite API returned an unexpected favorite.");
+  }
+
+  return {
+    areaId: thoughtfulAreaId,
+    contentType: thoughtfulContentType,
+    favorite,
+    revision: readPositiveInteger(payload.revision, "thoughtful favorite revision"),
+  };
+}
+
+/** Rejects an empty browser-provided route identity before starting a request. */
+function requireThoughtfulFavoriteId(value: string, field: string): void {
+  if (value.trim() === "") {
+    throw new Error(`A thoughtful ${field} cannot be blank.`);
+  }
+}
+
+/**
+ * Saves a durable copy of one current-week suggestion.
+ *
+ * The source id selects server-owned suggestion text; the revision identifies
+ * the snapshot the person saw. Both are encoded or validated at this boundary
+ * so a component only needs to pass the selected card and its current revision.
+ */
+export async function addThoughtfulFavorite(
+  sourceSuggestionId: string,
+  expectedRevision: number,
+  signal?: AbortSignal,
+): Promise<ThoughtfulFavoriteMutation> {
+  requireThoughtfulFavoriteId(sourceSuggestionId, "suggestion id");
+  readPositiveInteger(expectedRevision, "Thoughtful favorite expected revision");
+
+  const response = await fetch(
+    `/api/areas/${thoughtfulAreaId}/${thoughtfulContentType}/suggestions/${encodeURIComponent(sourceSuggestionId)}/favorite`,
+    {
+      method: "PUT",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ expected_revision: expectedRevision }),
+      signal,
+    },
+  );
+
+  if (!response.ok) {
+    throw new Error(`Unable to add thoughtful favorite (HTTP ${response.status}).`);
+  }
+  return readThoughtfulFavoriteMutation(await response.json(), { sourceSuggestionId });
+}
+
+/**
+ * Removes one durable Favorite without requiring its original weekly suggestion.
+ *
+ * A weekly refresh may have replaced the source card already, but the durable
+ * id remains sufficient for DELETE and the returned full record can support a
+ * future Undo interaction.
+ */
+export async function removeThoughtfulFavorite(
+  favoriteId: string,
+  expectedRevision: number,
+  signal?: AbortSignal,
+): Promise<ThoughtfulFavoriteMutation> {
+  requireThoughtfulFavoriteId(favoriteId, "favorite id");
+  readPositiveInteger(expectedRevision, "Thoughtful favorite expected revision");
+
+  const response = await fetch(
+    `/api/areas/${thoughtfulAreaId}/${thoughtfulContentType}/favorites/${encodeURIComponent(favoriteId)}`,
+    {
+      method: "DELETE",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ expected_revision: expectedRevision }),
+      signal,
+    },
+  );
+
+  if (!response.ok) {
+    throw new Error(`Unable to remove thoughtful favorite (HTTP ${response.status}).`);
+  }
+  return readThoughtfulFavoriteMutation(await response.json(), { id: favoriteId });
+}
+
 /**
  * Adapts the complete `/api/areas` payload into the domain model used by React.
  * Unknown documents are ignored until a display definition is intentionally
@@ -674,7 +968,14 @@ export function adaptAreaContentSnapshot(payload: unknown): ReviewAreaSnapshot {
     const entries =
       definition.id === "meals"
         ? readMealRecommendations(document.content)
-        : readEntryDocument(document.content, definition.id);
+        : definition.id === "thoughtful"
+          ? []
+          : readEntryDocument(document.content, definition.id);
+
+    const thoughtfulSuggestions =
+      definition.id === "thoughtful"
+        ? readThoughtfulSuggestionsContent(document.content, document.revision)
+        : undefined;
 
     return [{
       id: definition.id,
@@ -682,6 +983,7 @@ export function adaptAreaContentSnapshot(payload: unknown): ReviewAreaSnapshot {
       description: definition.description,
       accent: definition.accent,
       entries,
+      ...(thoughtfulSuggestions ? { thoughtfulSuggestions } : {}),
     }];
   });
 

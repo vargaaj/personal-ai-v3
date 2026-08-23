@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -409,6 +410,85 @@ func TestWeeklyUpdateRoutesAreRegisteredSeparately(t *testing.T) {
 				t.Fatalf("status = %d, want %d", response.Code, test.wantStatus)
 			}
 		})
+	}
+}
+
+// TestThoughtfulFavoriteRoutesUseApplicationClock exercises the routes through
+// serverApplication rather than through the favorite registrar's focused test
+// mux. A production-like frontend catch-all is also installed, proving that the
+// more specific API patterns win and return JSON instead of React's index.html.
+// The fixed local clock makes saved_at deterministic and verifies that main.go
+// passes its application-level date source into the PUT handler.
+func TestThoughtfulFavoriteRoutesUseApplicationClock(t *testing.T) {
+	state := thoughtfulFavoriteStorageState(false)
+	database := sql.OpenDB(entryStateStorageConnector{state: state})
+	t.Cleanup(func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("close thoughtful favorite application database: %v", err)
+		}
+	})
+
+	application := &serverApplication{
+		db:  database,
+		now: fixedThoughtfulFavoriteHTTPTime,
+		frontendFiles: fstest.MapFS{
+			"index.html": {
+				Data: []byte("<!doctype html><title>Personal AI</title>"),
+			},
+		},
+	}
+	handler := application.newHTTPHandler()
+
+	// Clicking the empty heart beside "Leave a note" sends only the source ID and
+	// current revision. The server copies the suggestion into a durable Favorite
+	// and returns its generated ID for later removal.
+	addRequest := httptest.NewRequest(
+		http.MethodPut,
+		"/api/areas/thoughtful/weekly_thoughtful_suggestions/suggestions/leave-note/favorite",
+		strings.NewReader(`{"expected_revision":7}`),
+	)
+	addResponse := httptest.NewRecorder()
+	handler.ServeHTTP(addResponse, addRequest)
+
+	if addResponse.Code != http.StatusOK {
+		t.Fatalf("add status = %d, want %d: %s", addResponse.Code, http.StatusOK, addResponse.Body.String())
+	}
+	var added ThoughtfulFavoriteMutation
+	if err := json.NewDecoder(addResponse.Body).Decode(&added); err != nil {
+		t.Fatalf("decode added favorite: %v", err)
+	}
+	if added.Revision != 8 || added.Favorite.SavedAt != "2026-08-20" {
+		t.Fatalf("added mutation = %#v, want revision 8 and application-local saved date", added)
+	}
+
+	// Clicking the filled heart addresses the durable Favorite returned above.
+	// Using revision 8 proves the DELETE request follows the state written by PUT
+	// and that both application-level routes are active on the same mux.
+	removeRequest := httptest.NewRequest(
+		http.MethodDelete,
+		fmt.Sprintf(
+			"/api/areas/thoughtful/weekly_thoughtful_suggestions/favorites/%s",
+			added.Favorite.ID,
+		),
+		strings.NewReader(`{"expected_revision":8}`),
+	)
+	removeResponse := httptest.NewRecorder()
+	handler.ServeHTTP(removeResponse, removeRequest)
+
+	if removeResponse.Code != http.StatusOK {
+		t.Fatalf(
+			"remove status = %d, want %d: %s",
+			removeResponse.Code,
+			http.StatusOK,
+			removeResponse.Body.String(),
+		)
+	}
+	var removed ThoughtfulFavoriteMutation
+	if err := json.NewDecoder(removeResponse.Body).Decode(&removed); err != nil {
+		t.Fatalf("decode removed favorite: %v", err)
+	}
+	if removed.Revision != 9 || removed.Favorite.ID != added.Favorite.ID {
+		t.Fatalf("removed mutation = %#v, want added Favorite removed at revision 9", removed)
 	}
 }
 

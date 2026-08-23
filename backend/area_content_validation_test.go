@@ -1,7 +1,8 @@
 // area_content_validation_test.go exercises the trusted local boundary for
-// generated Home, Health, and Meals documents. Its fixtures preserve legacy
-// Home shapes and structured weekly plans so validation changes cannot silently
-// alter what the Review interface accepts or saves.
+// generated Home, Health, Meals, and Thoughtful Suggestions documents. Its
+// fixtures preserve legacy Home shapes, structured weekly plans, and durable
+// favorites so validation changes cannot silently alter what the Review
+// interface accepts or saves.
 package main
 
 import (
@@ -473,6 +474,220 @@ func TestValidateGeneratedJSONRejectsMalformedStructuredWeeklyPlans(t *testing.T
 			t.Parallel()
 
 			err := validateGeneratedJSON(test.contentType, `{}`, test.updatedJSON, validationNow)
+			if err == nil {
+				t.Fatal("validateGeneratedJSON() returned nil, expected an error")
+			}
+			if !strings.Contains(err.Error(), test.wantMessage) {
+				t.Fatalf(
+					"validateGeneratedJSON() error = %q, want it to contain %q",
+					err,
+					test.wantMessage,
+				)
+			}
+		})
+	}
+}
+
+func TestValidateGeneratedJSONAcceptsNewThoughtfulSuggestionsAndPreservedFavorites(t *testing.T) {
+	t.Parallel()
+
+	// The existing document comes from the previous Sunday. Its weekly ideas may
+	// all change, while the saved tea favorite must survive byte-independent JSON
+	// decoding with the same fields and position in the Favorites section. Its
+	// source ID intentionally matches an original suggestion, but no generated
+	// suggestion below: the historical source is valid without being reused for
+	// the replacement week's list.
+	originalJSON := `{"week_starting":"2026-07-19","suggestions":[` +
+		`{"id":"old-note","title":"Leave a kind note","details":"Put it beside her coffee.","category":"encouragement"},` +
+		`{"id":"old-walk","title":"Suggest a short walk","details":"Choose a quiet route after dinner.","category":"quality time"},` +
+		`{"id":"old-chore","title":"Take over one chore","details":"Handle the evening dishes without asking.","category":"practical help"},` +
+		`{"id":"old-call","title":"Call during a break","details":"Ask about the part of her day that matters most.","category":"connection"},` +
+		`{"id":"old-breakfast","title":"Prepare breakfast","details":"Set out an easy meal before the morning gets busy.","category":"care"}` +
+		`],"favorites":[` +
+		`{"id":"favorite-tea","source_suggestion_id":"old-note","title":"Make her favorite tea","details":"Bring it to her while she is reading.","category":"care","saved_at":"2026-07-12"}` +
+		`]}`
+	updatedJSON := `{"week_starting":"2026-07-26","suggestions":[` +
+		`{"id":"new-snack","title":"Bring home a favorite snack","details":"Choose the one she rarely buys for herself.","category":"care"},` +
+		`{"id":"new-message","title":"Send a midday message","details":"Mention one specific thing you appreciate about her.","category":"encouragement"},` +
+		`{"id":"new-plan","title":"Plan an easy hour together","details":"Take care of the details so she only has to say yes.","category":"quality time"},` +
+		`{"id":"new-errand","title":"Handle an errand","details":"Take one small task off her list before she needs to ask.","category":"practical help"},` +
+		`{"id":"new-evening","title":"Make a calm evening plan","details":"Prepare a low-effort activity she can enjoy without planning.","category":"quality time"}` +
+		`],"favorites":[` +
+		`{"id":"favorite-tea","source_suggestion_id":"old-note","title":"Make her favorite tea","details":"Bring it to her while she is reading.","category":"care","saved_at":"2026-07-12"}` +
+		`]}`
+
+	if err := validateGeneratedJSON(
+		weeklyThoughtfulSuggestionsContentType,
+		originalJSON,
+		updatedJSON,
+		validationNow,
+	); err != nil {
+		t.Fatalf("validateGeneratedJSON() returned an unexpected error: %v", err)
+	}
+
+	var original, updated weeklyThoughtfulSuggestionsDocument
+	if err := json.Unmarshal([]byte(originalJSON), &original); err != nil {
+		t.Fatalf("decode original Thoughtful Suggestions fixture: %v", err)
+	}
+	if err := json.Unmarshal([]byte(updatedJSON), &updated); err != nil {
+		t.Fatalf("decode updated Thoughtful Suggestions fixture: %v", err)
+	}
+	if !reflect.DeepEqual(updated.Favorites, original.Favorites) {
+		t.Fatalf("updated favorites = %#v, want exact original %#v", updated.Favorites, original.Favorites)
+	}
+	if reflect.DeepEqual(updated.Suggestions, original.Suggestions) {
+		t.Fatal("updated suggestions unexpectedly equal the previous week's suggestions")
+	}
+}
+
+func TestValidateGeneratedJSONRejectsUnsafeThoughtfulSuggestionsUpdates(t *testing.T) {
+	t.Parallel()
+
+	originalJSON := `{"week_starting":"2026-07-19","suggestions":[` +
+		`{"id":"old-note","title":"Leave a kind note","details":"Put it beside her coffee.","category":"encouragement"},` +
+		`{"id":"old-walk","title":"Suggest a short walk","details":"Choose a quiet route after dinner.","category":"quality time"},` +
+		`{"id":"old-chore","title":"Take over one chore","details":"Handle the evening dishes without asking.","category":"practical help"},` +
+		`{"id":"old-call","title":"Call during a break","details":"Ask about the part of her day that matters most.","category":"connection"},` +
+		`{"id":"old-breakfast","title":"Prepare breakfast","details":"Set out an easy meal before the morning gets busy.","category":"care"}` +
+		`],"favorites":[` +
+		`{"id":"favorite-tea","source_suggestion_id":"old-note","title":"Make her favorite tea","details":"Bring it to her while she is reading.","category":"care","saved_at":"2026-07-12"}` +
+		`]}`
+	validUpdatedJSON := `{"week_starting":"2026-07-26","suggestions":[` +
+		`{"id":"new-snack","title":"Bring home a favorite snack","details":"Choose the one she rarely buys for herself.","category":"care"},` +
+		`{"id":"new-message","title":"Send a midday message","details":"Mention one specific thing you appreciate about her.","category":"encouragement"},` +
+		`{"id":"new-plan","title":"Plan an easy hour together","details":"Take care of the details so she only has to say yes.","category":"quality time"},` +
+		`{"id":"new-errand","title":"Handle an errand","details":"Take one small task off her list before she needs to ask.","category":"practical help"},` +
+		`{"id":"new-evening","title":"Make a calm evening plan","details":"Prepare a low-effort activity she can enjoy without planning.","category":"quality time"}` +
+		`],"favorites":[` +
+		`{"id":"favorite-tea","source_suggestion_id":"old-note","title":"Make her favorite tea","details":"Bring it to her while she is reading.","category":"care","saved_at":"2026-07-12"}` +
+		`]}`
+
+	tests := []struct {
+		name        string
+		updatedJSON string
+		wantMessage string
+	}{
+		{
+			name: "changes a saved favorite",
+			updatedJSON: strings.Replace(
+				validUpdatedJSON,
+				`"Make her favorite tea"`,
+				`"Make a cup of tea"`,
+				1,
+			),
+			wantMessage: "must preserve favorites unchanged",
+		},
+		{
+			name: "removes the saved favorites array",
+			updatedJSON: strings.Replace(
+				validUpdatedJSON,
+				`"favorites":[{"id":"favorite-tea","source_suggestion_id":"old-note","title":"Make her favorite tea","details":"Bring it to her while she is reading.","category":"care","saved_at":"2026-07-12"}]`,
+				`"favorites":[]`,
+				1,
+			),
+			wantMessage: "must preserve favorites unchanged",
+		},
+		{
+			name:        "uses the previous week",
+			updatedJSON: strings.Replace(validUpdatedJSON, `"2026-07-26"`, `"2026-07-19"`, 1),
+			wantMessage: "week_starting must equal target week 2026-07-26",
+		},
+		{
+			name: "returns four weekly ideas instead of five",
+			updatedJSON: strings.Replace(
+				validUpdatedJSON,
+				`,{"id":"new-evening","title":"Make a calm evening plan","details":"Prepare a low-effort activity she can enjoy without planning.","category":"quality time"}`,
+				"",
+				1,
+			),
+			wantMessage: "must contain exactly 5 suggestions, got 4",
+		},
+		{
+			name: "returns six weekly ideas instead of five",
+			updatedJSON: strings.Replace(
+				validUpdatedJSON,
+				`],"favorites"`,
+				`,{"id":"new-lunch","title":"Prepare an easy lunch","details":"Set aside something she can enjoy without another decision.","category":"care"}],"favorites"`,
+				1,
+			),
+			wantMessage: "must contain exactly 5 suggestions, got 6",
+		},
+		{
+			name: "omits a favorite source suggestion ID",
+			updatedJSON: strings.Replace(
+				validUpdatedJSON,
+				`"source_suggestion_id":"old-note",`,
+				"",
+				1,
+			),
+			wantMessage: "source_suggestion_id is required",
+		},
+		{
+			name: "adds whitespace to a favorite source suggestion ID",
+			updatedJSON: strings.Replace(
+				validUpdatedJSON,
+				`"source_suggestion_id":"old-note"`,
+				`"source_suggestion_id":" old-note "`,
+				1,
+			),
+			wantMessage: "source_suggestion_id must not have leading or trailing whitespace",
+		},
+		{
+			name: "uses the same source suggestion for two favorites",
+			updatedJSON: strings.Replace(
+				validUpdatedJSON,
+				`]}`,
+				`,{"id":"favorite-book","source_suggestion_id":"old-note","title":"Bring a book","details":"Choose one she has been wanting to read.","category":"care","saved_at":"2026-07-13"}]}`,
+				1,
+			),
+			wantMessage: "repeats source_suggestion_id",
+		},
+		{
+			// A changed favorite would normally fail the exact-copy comparison. The
+			// expected source-reuse error proves the generated-output-only check runs
+			// first, after the updated document has passed its own shape validation.
+			name: "reuses a preserved favorite source before favorites preservation",
+			updatedJSON: strings.Replace(
+				strings.Replace(validUpdatedJSON, `"id":"new-plan"`, `"id":"old-note"`, 1),
+				`"Make her favorite tea"`,
+				`"Changed favorite title"`,
+				1,
+			),
+			wantMessage: "reuses preserved favorite source_suggestion_id",
+		},
+		{
+			name:        "reuses a favorite identifier in the weekly list",
+			updatedJSON: strings.Replace(validUpdatedJSON, `"new-snack"`, `"favorite-tea"`, 1),
+			wantMessage: "repeats id",
+		},
+		{
+			name: "omits the favorites property instead of returning an empty array",
+			updatedJSON: strings.Replace(
+				validUpdatedJSON,
+				`,"favorites":[{"id":"favorite-tea","source_suggestion_id":"old-note","title":"Make her favorite tea","details":"Bring it to her while she is reading.","category":"care","saved_at":"2026-07-12"}]`,
+				"",
+				1,
+			),
+			wantMessage: "favorites must be an array",
+		},
+		{
+			name:        "returns an unknown top-level field",
+			updatedJSON: strings.Replace(validUpdatedJSON, `{"week_starting"`, `{"notes":"extra","week_starting"`, 1),
+			wantMessage: "unknown field",
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := validateGeneratedJSON(
+				weeklyThoughtfulSuggestionsContentType,
+				originalJSON,
+				test.updatedJSON,
+				validationNow,
+			)
 			if err == nil {
 				t.Fatal("validateGeneratedJSON() returned nil, expected an error")
 			}

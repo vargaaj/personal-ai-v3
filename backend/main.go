@@ -119,12 +119,15 @@ import (
 )
 
 // serverApplication contains the concrete services used by HTTP requests. API
-// handlers read through db or call updater directly. frontendFiles is optional:
-// Vite serves the interface during local development, while the Cloud Run
-// container supplies the built React files through FRONTEND_DIST_DIR.
+// handlers read through db or call updater directly. The injected clock gives
+// mutations that store a calendar date the same New York-local view of "today"
+// as weekly generation. frontendFiles is optional: Vite serves the interface
+// during local development, while the Cloud Run container supplies the built
+// React files through FRONTEND_DIST_DIR.
 type serverApplication struct {
 	db            *sql.DB
 	updater       *localizedAreaUpdater
+	now           func() time.Time
 	frontendFiles fs.FS
 }
 
@@ -235,8 +238,14 @@ func main() {
 	// refers to this one shared application instead of receiving a struct copy.
 	// serverApplication owns the concrete database pool used by every handler and
 	// update operation; no loader function is hidden behind a main.go type alias.
+	// The clock converts the current instant to New York time before a Favorite is
+	// saved, so saved_at records the date the person sees even when UTC has already
+	// advanced to the following day.
 	application := &serverApplication{
 		db: db,
+		now: func() time.Time {
+			return time.Now().In(updateLocation)
+		},
 	}
 
 	// Local development normally leaves FRONTEND_DIST_DIR empty because Vite
@@ -338,8 +347,8 @@ func logAreaUpdateResults(trigger string, results []AreaUpdateResult) {
 
 // newHTTPHandler registers the application's routes. Each request calls a
 // concrete method or storage function: GET calls loadAreaContents with
-// application.db, prompt and entry-state routes are composed by their focused
-// registrars, and POST calls application.updater.run.
+// application.db, focused registrars compose prompt and item-mutation routes,
+// and POST calls application.updater.run.
 func (application *serverApplication) newHTTPHandler() http.Handler {
 	mux := http.NewServeMux()
 
@@ -361,6 +370,13 @@ func (application *serverApplication) newHTTPHandler() http.Handler {
 	// Its storage function reads the current revision before its conditional save,
 	// so this route cannot overwrite a concurrent weekly regeneration.
 	registerAreaEntryStateRoutes(mux, application.db)
+
+	// The Thoughtful Suggestions heart buttons add and remove durable Favorites.
+	// PUT receives the application clock because storage records the local saved
+	// date; DELETE does not need the clock but shares this focused route registrar.
+	// These specific API patterns take precedence over the production React
+	// catch-all registered near the end of this function.
+	registerAreaFavoriteRoutes(mux, application.db, application.now)
 
 	// The Review screen's manual button calls this endpoint to regenerate all
 	// weekly documents immediately. Passing force=true bypasses the current-week
