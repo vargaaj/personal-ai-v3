@@ -138,6 +138,83 @@ func TestBuildChatRequestUsesStrictSchemaForWeeklyMealRecommendations(t *testing
 	}
 }
 
+func TestBuildChatRequestUsesStrictSchemaForWeeklyThoughtfulSuggestions(t *testing.T) {
+	t.Parallel()
+
+	// The input includes one existing favorite so this request proves that the
+	// provider receives the durable favorite shape it must return unchanged.
+	request := buildChatRequest(
+		"Create five new suggestions for the requested current week while preserving favorites.",
+		`{"week_starting":"2026-07-19","suggestions":[],"favorites":[{"id":"favorite-tea","source_suggestion_id":"old-tea","title":"Make her favorite tea","details":"Bring it while she is reading.","category":"care","saved_at":"2026-07-12"}]}`,
+		weeklyThoughtfulSuggestionsContentType,
+		false,
+	)
+	payload := marshalChatRequestForTest(t, request)
+
+	assertRequestRequiresResponseFormatForTest(t, payload)
+	_, schema := responseSchemaForTest(t, payload, weeklyThoughtfulSuggestionsContentType, true)
+	assertSchemaRequiredFieldsForTest(
+		t,
+		schema,
+		"thoughtful suggestions document",
+		[]string{"week_starting", "suggestions", "favorites"},
+	)
+
+	properties := objectFieldForTest(t, schema, "properties")
+	weekStarting := objectFieldForTest(t, properties, "week_starting")
+	if gotPattern := weekStarting["pattern"]; gotPattern != `^\d{4}-\d{2}-\d{2}$` {
+		t.Fatalf("thoughtful suggestions week_starting pattern = %v, want YYYY-MM-DD", gotPattern)
+	}
+
+	suggestions := objectFieldForTest(t, properties, "suggestions")
+	if gotMinimum := suggestions["minItems"]; gotMinimum != float64(5) {
+		t.Fatalf("thoughtful suggestions minItems = %v, want 5", gotMinimum)
+	}
+	if gotMaximum := suggestions["maxItems"]; gotMaximum != float64(5) {
+		t.Fatalf("thoughtful suggestions maxItems = %v, want 5", gotMaximum)
+	}
+	suggestionSchema := objectFieldForTest(t, suggestions, "items")
+	assertSchemaRequiredFieldsForTest(
+		t,
+		suggestionSchema,
+		"thoughtful suggestion",
+		[]string{"id", "title", "details", "category"},
+	)
+
+	favorites := objectFieldForTest(t, properties, "favorites")
+	favoriteSchema := objectFieldForTest(t, favorites, "items")
+	assertSchemaRequiredFieldsForTest(
+		t,
+		favoriteSchema,
+		"thoughtful favorite",
+		[]string{
+			"id",
+			"source_suggestion_id",
+			"title",
+			"details",
+			"category",
+			"saved_at",
+		},
+	)
+
+	// These instructions carry the preservation rules JSON Schema cannot express:
+	// a new weekly idea must not duplicate a saved idea, and each durable saved
+	// record must retain every field and its visible Favorites-list position.
+	description, ok := schema["description"].(string)
+	if !ok {
+		t.Fatalf("thoughtful suggestions schema description = %#v, want a string", schema["description"])
+	}
+	for _, requiredInstruction := range []string{
+		"requested current week",
+		"do not repeat any saved favorite",
+		"Copy every favorite exactly and in the same order",
+	} {
+		if !strings.Contains(description, requiredInstruction) {
+			t.Fatalf("thoughtful suggestions schema description omitted %q: %q", requiredInstruction, description)
+		}
+	}
+}
+
 func TestBuildChatRequestUsesLegacyCompatibleTaskSchemaForHome(t *testing.T) {
 	t.Parallel()
 
@@ -418,6 +495,46 @@ func responseSchemaForTest(
 		t.Fatalf("schema additionalProperties = %v, want false", gotAdditionalProperties)
 	}
 	return jsonSchema, schema
+}
+
+// assertSchemaRequiredFieldsForTest verifies an object exposes precisely the
+// stored fields its corresponding Review record needs. It also confirms that
+// strict schemas reject unrecognized fields instead of permitting a provider
+// to invent data the application would not know how to display or preserve.
+func assertSchemaRequiredFieldsForTest(
+	t *testing.T,
+	schema map[string]any,
+	itemName string,
+	wantFields []string,
+) {
+	t.Helper()
+
+	requiredFields, ok := schema["required"].([]any)
+	if !ok {
+		t.Fatalf("%s required fields = %#v, want an array", itemName, schema["required"])
+	}
+	if len(requiredFields) != len(wantFields) {
+		t.Fatalf(
+			"len(%s required fields) = %d, want %d",
+			itemName,
+			len(requiredFields),
+			len(wantFields),
+		)
+	}
+	for index, wantField := range wantFields {
+		if requiredFields[index] != wantField {
+			t.Fatalf(
+				"%s required field %d = %v, want %q",
+				itemName,
+				index,
+				requiredFields[index],
+				wantField,
+			)
+		}
+	}
+	if gotAdditionalProperties := schema["additionalProperties"]; gotAdditionalProperties != false {
+		t.Fatalf("%s additionalProperties = %v, want false", itemName, gotAdditionalProperties)
+	}
 }
 
 // objectFieldForTest reads a nested JSON object and reports the surrounding

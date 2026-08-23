@@ -7,14 +7,51 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   adaptAreaContentSnapshot,
   adaptAreaContents,
+  addThoughtfulFavorite,
   fetchReviewAreaSnapshot,
   fetchReviewAreas,
   fetchAreaContentPrompt,
   requestAreaContentUpdate,
   requestWeeklyAreaUpdate,
+  removeThoughtfulFavorite,
   saveAreaContentPrompt,
   saveAreaEntryState,
 } from "./areaContentApi";
+
+/**
+ * A complete server-shaped Thoughtful document used by adapter and mutation
+ * tests. It models the five-card week plus one durable saved gesture, which is
+ * the smallest realistic state that exercises both independently keyed lists.
+ */
+function thoughtfulDocument(overrides: Record<string, unknown> = {}) {
+  return {
+    area_id: "thoughtful",
+    content_type: "weekly_thoughtful_suggestions",
+    revision: 8,
+    updated_at: "2026-07-22T12:00:00Z",
+    content: {
+      week_starting: "2026-07-19",
+      suggestions: [
+        { id: "leave-note", title: "Leave a note", details: "Put it in her book.", category: "care" },
+        { id: "plan-walk", title: "Plan a walk", details: "Choose an easy route.", category: "quality time" },
+        { id: "make-tea", title: "Make tea", details: "Bring it while she reads.", category: "care" },
+        { id: "share-song", title: "Share a song", details: "Send a small favorite.", category: "encouragement" },
+        { id: "handle-errand", title: "Handle an errand", details: "Take one decision away.", category: "practical help" },
+      ],
+      favorites: [
+        {
+          id: "favorite-walk",
+          source_suggestion_id: "plan-walk",
+          title: "Plan a walk",
+          details: "Choose an easy route.",
+          category: "quality time",
+          saved_at: "2026-07-20",
+        },
+      ],
+    },
+    ...overrides,
+  };
+}
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -116,6 +153,68 @@ describe("areaContentApi", () => {
       health: "2026-07-22T12:00:00Z",
       meals: "2026-07-22T09:30:00-04:00",
     });
+  });
+
+  it("translates Thoughtful Suggestions after Meals without inventing entry state", () => {
+    const snapshot = adaptAreaContentSnapshot([
+      {
+        area_id: "meals",
+        content_type: "weekly_meal_recommendations",
+        revision: 3,
+        updated_at: "2026-07-22T09:30:00-04:00",
+        content: { week_starting: "2026-07-19", recommendations: [] },
+      },
+      thoughtfulDocument(),
+    ]);
+
+    expect(snapshot.areas.map((area) => area.id)).toEqual(["meals", "thoughtful"]);
+    expect(snapshot.areas[1]).toMatchObject({
+      accent: "rose",
+      entries: [],
+      thoughtfulSuggestions: {
+        weekStarting: "2026-07-19",
+        revision: 8,
+        suggestions: [{ id: "leave-note" }, { id: "plan-walk" }, { id: "make-tea" }, { id: "share-song" }, { id: "handle-errand" }],
+        favorites: [{
+          id: "favorite-walk",
+          sourceSuggestionId: "plan-walk",
+          savedAt: "2026-07-20",
+        }],
+      },
+    });
+    expect(snapshot.updatedAtByArea.thoughtful).toBe("2026-07-22T12:00:00Z");
+  });
+
+  it("rejects malformed Thoughtful documents that would break list keys or revision safety", () => {
+    const malformedDocuments = [
+      thoughtfulDocument({ content: { ...thoughtfulDocument().content as object, suggestions: [] } }),
+      thoughtfulDocument({ content: { ...thoughtfulDocument().content as object, suggestions: [
+        { id: "repeat", title: "One", details: "First", category: "care" },
+        { id: "repeat", title: "Two", details: "Second", category: "care" },
+        { id: "three", title: "Three", details: "Third", category: "care" },
+        { id: "four", title: "Four", details: "Fourth", category: "care" },
+        { id: "five", title: "Five", details: "Fifth", category: "care" },
+      ] } }),
+      thoughtfulDocument({ content: { ...thoughtfulDocument().content as object, favorites: [
+        { id: "favorite-a", source_suggestion_id: "plan-walk", title: "A", details: "A", category: "care", saved_at: "2026-07-20" },
+        { id: "favorite-b", source_suggestion_id: "plan-walk", title: "B", details: "B", category: "care", saved_at: "2026-07-20" },
+      ] } }),
+      thoughtfulDocument({ content: { ...thoughtfulDocument().content as object, favorites: [
+        { id: "favorite-repeat", source_suggestion_id: "plan-walk", title: "A", details: "A", category: "care", saved_at: "2026-07-20" },
+        { id: "favorite-repeat", source_suggestion_id: "make-tea", title: "B", details: "B", category: "care", saved_at: "2026-07-20" },
+      ] } }),
+      thoughtfulDocument({ content: { ...thoughtfulDocument().content as object, favorites: [
+        { id: "favorite-a", source_suggestion_id: "plan-walk", title: "A", details: "A", category: "care", saved_at: "2026-02-30" },
+      ] } }),
+      // July 20 is a real calendar date, but Monday cannot start Go's Sunday
+      // Thoughtful planning week. This keeps savedAt's any-day rule separate.
+      thoughtfulDocument({ content: { ...thoughtfulDocument().content as object, week_starting: "2026-07-20" } }),
+      thoughtfulDocument({ revision: 0 }),
+    ];
+
+    for (const document of malformedDocuments) {
+      expect(() => adaptAreaContents([document])).toThrow();
+    }
   });
 
   it("ignores the stored Reading document while that area is retired", () => {
@@ -358,6 +457,166 @@ describe("areaContentApi", () => {
 
     await expect(saveAreaEntryState("health", "monday-strength", "open")).rejects.toThrow(
       "Entry state field revision must be an integer.",
+    );
+  });
+
+  it("adds a Thoughtful Favorite through an encoded PUT route and confirms its source", async () => {
+    const controller = new AbortController();
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({
+        area_id: "thoughtful",
+        content_type: "weekly_thoughtful_suggestions",
+        favorite: {
+          id: "favorite-note",
+          source_suggestion_id: "leave / note",
+          title: "Leave a note",
+          details: "Put it in her book.",
+          category: "care",
+          saved_at: "2026-07-20",
+        },
+        revision: 9,
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(addThoughtfulFavorite("leave / note", 8, controller.signal)).resolves.toEqual({
+      areaId: "thoughtful",
+      contentType: "weekly_thoughtful_suggestions",
+      favorite: {
+        id: "favorite-note",
+        sourceSuggestionId: "leave / note",
+        title: "Leave a note",
+        details: "Put it in her book.",
+        category: "care",
+        savedAt: "2026-07-20",
+      },
+      revision: 9,
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/areas/thoughtful/weekly_thoughtful_suggestions/suggestions/leave%20%2F%20note/favorite",
+      {
+        method: "PUT",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({ expected_revision: 8 }),
+        signal: controller.signal,
+      },
+    );
+  });
+
+  it("removes a Thoughtful Favorite through an encoded DELETE route and confirms its durable id", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({
+        area_id: "thoughtful",
+        content_type: "weekly_thoughtful_suggestions",
+        favorite: {
+          id: "favorite / walk",
+          source_suggestion_id: "plan-walk",
+          title: "Plan a walk",
+          details: "Choose an easy route.",
+          category: "quality time",
+          saved_at: "2026-07-20",
+        },
+        revision: 9,
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(removeThoughtfulFavorite("favorite / walk", 8)).resolves.toMatchObject({
+      favorite: { id: "favorite / walk", sourceSuggestionId: "plan-walk" },
+      revision: 9,
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/areas/thoughtful/weekly_thoughtful_suggestions/favorites/favorite%20%2F%20walk",
+      {
+        method: "DELETE",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({ expected_revision: 8 }),
+        signal: undefined,
+      },
+    );
+  });
+
+  it("rejects invalid Thoughtful mutations before fetch and rejects unsafe successful responses", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(addThoughtfulFavorite("  ", 8)).rejects.toThrow("cannot be blank");
+    await expect(removeThoughtfulFavorite("favorite-walk", 0)).rejects.toThrow("positive integer");
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({
+        area_id: "thoughtful",
+        content_type: "weekly_thoughtful_suggestions",
+        favorite: {
+          id: "different-favorite",
+          source_suggestion_id: "different-source",
+          title: "Different",
+          details: "Different record.",
+          category: "care",
+          saved_at: "2026-07-20",
+        },
+        revision: 9,
+      }),
+    });
+    await expect(addThoughtfulFavorite("leave-note", 8)).rejects.toThrow("unexpected favorite");
+    await expect(removeThoughtfulFavorite("favorite-walk", 8)).rejects.toThrow("unexpected favorite");
+
+    // A complete Favorite is still unsafe when its enclosing document identity
+    // is not Thoughtful's fixed route target, or when its revision cannot be
+    // used as the expected revision for the next heart click.
+    fetchMock.mockReset().mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({
+        area_id: "meals",
+        content_type: "weekly_thoughtful_suggestions",
+        favorite: {
+          id: "favorite-note",
+          source_suggestion_id: "leave-note",
+          title: "Leave a note",
+          details: "Put it in her book.",
+          category: "care",
+          saved_at: "2026-07-20",
+        },
+        revision: 9,
+      }),
+    }).mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({
+        area_id: "thoughtful",
+        content_type: "weekly_thoughtful_suggestions",
+        favorite: {
+          id: "favorite-note",
+          source_suggestion_id: "leave-note",
+          title: "Leave a note",
+          details: "Put it in her book.",
+          category: "care",
+          saved_at: "2026-07-20",
+        },
+        revision: 0,
+      }),
+    });
+    await expect(addThoughtfulFavorite("leave-note", 8)).rejects.toThrow("unexpected area");
+    await expect(addThoughtfulFavorite("leave-note", 8)).rejects.toThrow("positive integer");
+  });
+
+  it("reports action-specific HTTP failures without reading an error response as a Favorite", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: false, status: 409, json: vi.fn() });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(addThoughtfulFavorite("leave-note", 8)).rejects.toThrow(
+      "Unable to add thoughtful favorite (HTTP 409).",
+    );
+    await expect(removeThoughtfulFavorite("favorite-note", 8)).rejects.toThrow(
+      "Unable to remove thoughtful favorite (HTTP 409).",
     );
   });
 

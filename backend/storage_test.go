@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -544,6 +545,555 @@ func (rows *promptStorageRows) Next(destination []driver.Value) error {
 	return nil
 }
 
+// TestAddThoughtfulFavoriteCopiesStoredSuggestion verifies the complete add
+// path without a live database. The browser identifies one source suggestion,
+// but the saved prose and category must come from the database document. The
+// new Favorite is placed first so the visible list reads newest-saved first.
+func TestAddThoughtfulFavoriteCopiesStoredSuggestion(t *testing.T) {
+	updatedAt := time.Date(2026, time.July, 26, 10, 30, 0, 0, time.UTC)
+	state := &entryStateStorageState{
+		documents: map[string]entryStateStorageRow{
+			entryStateStorageKey("thoughtful", weeklyThoughtfulSuggestionsContentType): {
+				content:   thoughtfulSuggestionsStorageFixture(),
+				revision:  7,
+				updatedAt: updatedAt,
+			},
+		},
+	}
+	database := sql.OpenDB(entryStateStorageConnector{state: state})
+	t.Cleanup(func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("close thoughtful favorite storage database: %v", err)
+		}
+	})
+
+	savedAt := time.Date(2026, time.August, 20, 18, 45, 0, 0, time.FixedZone("EDT", -4*60*60))
+	mutation, err := addThoughtfulFavorite(
+		context.Background(),
+		database,
+		" thoughtful ",
+		" weekly_thoughtful_suggestions ",
+		"leave-note",
+		7,
+		savedAt,
+	)
+	if err != nil {
+		t.Fatalf("addThoughtfulFavorite() returned an unexpected error: %v", err)
+	}
+	if mutation.AreaID != "thoughtful" || mutation.ContentType != weeklyThoughtfulSuggestionsContentType {
+		t.Fatalf("mutation identifiers = %q/%q, want thoughtful/%s", mutation.AreaID, mutation.ContentType, weeklyThoughtfulSuggestionsContentType)
+	}
+	if mutation.Revision != 8 {
+		t.Fatalf("mutation revision = %d, want 8", mutation.Revision)
+	}
+	if mutation.Favorite.ID == "" || mutation.Favorite.ID == mutation.Favorite.SourceSuggestionID {
+		t.Fatalf("favorite identity = %#v, want a distinct durable id", mutation.Favorite)
+	}
+	if !strings.HasPrefix(mutation.Favorite.ID, "favorite-") {
+		t.Fatalf("favorite id = %q, want favorite- prefix", mutation.Favorite.ID)
+	}
+	if mutation.Favorite.SourceSuggestionID != "leave-note" ||
+		mutation.Favorite.Title != "Leave a note by her coffee" ||
+		mutation.Favorite.Details != "Mention one specific thing you appreciate." ||
+		mutation.Favorite.Category != "encouragement" ||
+		mutation.Favorite.SavedAt != "2026-08-20" {
+		t.Fatalf("saved favorite = %#v, want an exact server-side copy with local saved date", mutation.Favorite)
+	}
+
+	for _, requiredClause := range []string{
+		"SET content = $3::jsonb, revision = revision + 1",
+		"AND revision = $4",
+		"RETURNING area_id, content_type, content::text, revision, updated_at",
+	} {
+		if !strings.Contains(state.updateQuery, requiredClause) {
+			t.Fatalf("update query = %q, want clause %q", state.updateQuery, requiredClause)
+		}
+	}
+	if strings.Contains(state.updateQuery, "updated_at =") {
+		t.Fatalf("update query = %q, must not change the weekly generation timestamp", state.updateQuery)
+	}
+
+	stored := state.documents[entryStateStorageKey("thoughtful", weeklyThoughtfulSuggestionsContentType)]
+	if !stored.updatedAt.Equal(updatedAt) {
+		t.Fatalf("updated_at = %s, want unchanged %s", stored.updatedAt, updatedAt)
+	}
+	var document weeklyThoughtfulSuggestionsDocument
+	if err := json.Unmarshal([]byte(stored.content), &document); err != nil {
+		t.Fatalf("decode stored thoughtful document: %v", err)
+	}
+	if len(document.Suggestions) != 5 {
+		t.Fatalf("stored suggestions = %d, want all 5 preserved", len(document.Suggestions))
+	}
+	if len(document.Favorites) != 2 {
+		t.Fatalf("stored favorites = %d, want new and existing favorites", len(document.Favorites))
+	}
+	if document.Favorites[0] != mutation.Favorite {
+		t.Fatalf("first stored favorite = %#v, want new favorite %#v", document.Favorites[0], mutation.Favorite)
+	}
+	if document.Favorites[1].ID != "favorite-walk" {
+		t.Fatalf("second stored favorite id = %q, want existing favorite order preserved", document.Favorites[1].ID)
+	}
+}
+
+// TestRemoveThoughtfulFavoriteReturnsDeletedRecord verifies that removal uses a
+// durable Favorite ID even when its original suggestion is no longer present.
+// Returning the complete record is the persistence boundary needed by a later
+// eight-second Undo interaction.
+func TestRemoveThoughtfulFavoriteReturnsDeletedRecord(t *testing.T) {
+	updatedAt := time.Date(2026, time.July, 26, 10, 30, 0, 0, time.UTC)
+	state := &entryStateStorageState{
+		documents: map[string]entryStateStorageRow{
+			entryStateStorageKey("thoughtful", weeklyThoughtfulSuggestionsContentType): {
+				content:   thoughtfulSuggestionsStorageFixture(),
+				revision:  7,
+				updatedAt: updatedAt,
+			},
+		},
+	}
+	database := sql.OpenDB(entryStateStorageConnector{state: state})
+	t.Cleanup(func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("close thoughtful favorite storage database: %v", err)
+		}
+	})
+
+	mutation, err := removeThoughtfulFavorite(
+		context.Background(),
+		database,
+		"thoughtful",
+		weeklyThoughtfulSuggestionsContentType,
+		"favorite-walk",
+		7,
+	)
+	if err != nil {
+		t.Fatalf("removeThoughtfulFavorite() returned an unexpected error: %v", err)
+	}
+	if mutation.Revision != 8 {
+		t.Fatalf("mutation revision = %d, want 8", mutation.Revision)
+	}
+	if mutation.Favorite.ID != "favorite-walk" ||
+		mutation.Favorite.SourceSuggestionID != "plan-walk" ||
+		mutation.Favorite.Title != "Plan a short walk" {
+		t.Fatalf("removed favorite = %#v, want the complete deleted record", mutation.Favorite)
+	}
+
+	stored := state.documents[entryStateStorageKey("thoughtful", weeklyThoughtfulSuggestionsContentType)]
+	if !stored.updatedAt.Equal(updatedAt) {
+		t.Fatalf("updated_at = %s, want unchanged %s", stored.updatedAt, updatedAt)
+	}
+	var document weeklyThoughtfulSuggestionsDocument
+	if err := json.Unmarshal([]byte(stored.content), &document); err != nil {
+		t.Fatalf("decode stored thoughtful document: %v", err)
+	}
+	if len(document.Favorites) != 0 {
+		t.Fatalf("stored favorites = %#v, want the selected favorite removed", document.Favorites)
+	}
+	if len(document.Suggestions) != 5 || document.Suggestions[0].ID != "leave-note" {
+		t.Fatalf("stored suggestions = %#v, want weekly suggestions unchanged", document.Suggestions)
+	}
+}
+
+// TestRestoreThoughtfulFavoriteReinstatesExpiredSourceRecord verifies the
+// storage prerequisite for eight-second Undo. The removed Favorite's weekly
+// source is deliberately absent from the current Suggestions array, so this
+// test proves restore uses the supplied durable record rather than looking up a
+// source that a weekly refresh may already have replaced.
+func TestRestoreThoughtfulFavoriteReinstatesExpiredSourceRecord(t *testing.T) {
+	updatedAt := time.Date(2026, time.August, 2, 10, 30, 0, 0, time.UTC)
+	state := &entryStateStorageState{
+		documents: map[string]entryStateStorageRow{
+			entryStateStorageKey("thoughtful", weeklyThoughtfulSuggestionsContentType): {
+				content:   thoughtfulSuggestionsStorageFixture(),
+				revision:  12,
+				updatedAt: updatedAt,
+			},
+		},
+	}
+	database := sql.OpenDB(entryStateStorageConnector{state: state})
+	t.Cleanup(func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("close thoughtful favorite storage database: %v", err)
+		}
+	})
+
+	// This is the exact record a prior remove operation would return. Its source
+	// ID is not one of the fixture's active suggestions, modelling an expired
+	// weekly card while retaining every durable field needed by Undo.
+	removedFavorite := thoughtfulFavorite{
+		ID:                 "favorite-expired-idea",
+		SourceSuggestionID: "expired-suggestion",
+		Title:              "Bring home her favorite pastry",
+		Details:            "Pick one up on the way home after her long meeting.",
+		Category:           "care",
+		SavedAt:            "2026-07-19",
+	}
+	var before weeklyThoughtfulSuggestionsDocument
+	if err := json.Unmarshal([]byte(thoughtfulSuggestionsStorageFixture()), &before); err != nil {
+		t.Fatalf("decode original thoughtful document: %v", err)
+	}
+	for _, suggestion := range before.Suggestions {
+		if suggestion.ID == removedFavorite.SourceSuggestionID {
+			t.Fatalf("fixture unexpectedly contains historical source %q", removedFavorite.SourceSuggestionID)
+		}
+	}
+
+	mutation, err := restoreThoughtfulFavorite(
+		context.Background(),
+		database,
+		" thoughtful ",
+		" weekly_thoughtful_suggestions ",
+		removedFavorite,
+		12,
+	)
+	if err != nil {
+		t.Fatalf("restoreThoughtfulFavorite() returned an unexpected error: %v", err)
+	}
+	if mutation.AreaID != "thoughtful" || mutation.ContentType != weeklyThoughtfulSuggestionsContentType {
+		t.Fatalf("mutation identifiers = %q/%q, want thoughtful/%s", mutation.AreaID, mutation.ContentType, weeklyThoughtfulSuggestionsContentType)
+	}
+	if mutation.Revision != 13 {
+		t.Fatalf("mutation revision = %d, want 13", mutation.Revision)
+	}
+	if mutation.Favorite != removedFavorite {
+		t.Fatalf("mutation favorite = %#v, want exact removed record %#v", mutation.Favorite, removedFavorite)
+	}
+
+	stored := state.documents[entryStateStorageKey("thoughtful", weeklyThoughtfulSuggestionsContentType)]
+	if !stored.updatedAt.Equal(updatedAt) {
+		t.Fatalf("updated_at = %s, want unchanged %s", stored.updatedAt, updatedAt)
+	}
+	var after weeklyThoughtfulSuggestionsDocument
+	if err := json.Unmarshal([]byte(stored.content), &after); err != nil {
+		t.Fatalf("decode restored thoughtful document: %v", err)
+	}
+	if !reflect.DeepEqual(after.Suggestions, before.Suggestions) {
+		t.Fatalf("stored suggestions = %#v, want unchanged %#v", after.Suggestions, before.Suggestions)
+	}
+	if len(after.Favorites) != len(before.Favorites)+1 {
+		t.Fatalf("stored favorites = %#v, want restored record plus existing favorites", after.Favorites)
+	}
+	if after.Favorites[0] != removedFavorite {
+		t.Fatalf("first stored favorite = %#v, want restored record %#v", after.Favorites[0], removedFavorite)
+	}
+	if !reflect.DeepEqual(after.Favorites[1:], before.Favorites) {
+		t.Fatalf("remaining favorites = %#v, want unchanged %#v", after.Favorites[1:], before.Favorites)
+	}
+}
+
+// TestRestoreThoughtfulFavoriteRejectsStaleAndDuplicateRecords verifies that
+// Undo cannot overwrite a newer document or add the same durable Favorite
+// twice. Neither pre-save rejection should issue the conditional UPDATE.
+func TestRestoreThoughtfulFavoriteRejectsStaleAndDuplicateRecords(t *testing.T) {
+	validRemovedFavorite := thoughtfulFavorite{
+		ID:                 "favorite-expired-idea",
+		SourceSuggestionID: "expired-suggestion",
+		Title:              "Bring home her favorite pastry",
+		Details:            "Pick one up on the way home after her long meeting.",
+		Category:           "care",
+		SavedAt:            "2026-07-19",
+	}
+
+	for _, test := range []struct {
+		name      string
+		favorite  thoughtfulFavorite
+		revision  int
+		wantError error
+	}{
+		{
+			name:      "stale revision",
+			favorite:  validRemovedFavorite,
+			revision:  6,
+			wantError: errThoughtfulFavoriteRevisionConflict,
+		},
+		{
+			name: "duplicate durable ID",
+			favorite: thoughtfulFavorite{
+				ID:                 "favorite-walk",
+				SourceSuggestionID: "expired-suggestion",
+				Title:              validRemovedFavorite.Title,
+				Details:            validRemovedFavorite.Details,
+				Category:           validRemovedFavorite.Category,
+				SavedAt:            validRemovedFavorite.SavedAt,
+			},
+			revision:  7,
+			wantError: errThoughtfulFavoriteAlreadyExists,
+		},
+		{
+			// Favorite IDs share the document-wide identity namespace with the
+			// active weekly Suggestions, even though this source has expired.
+			name: "durable ID collides with current suggestion",
+			favorite: thoughtfulFavorite{
+				ID:                 "leave-note",
+				SourceSuggestionID: "expired-suggestion",
+				Title:              validRemovedFavorite.Title,
+				Details:            validRemovedFavorite.Details,
+				Category:           validRemovedFavorite.Category,
+				SavedAt:            validRemovedFavorite.SavedAt,
+			},
+			revision:  7,
+			wantError: errThoughtfulFavoriteAlreadyExists,
+		},
+		{
+			name: "source identity collides with existing favorite",
+			favorite: thoughtfulFavorite{
+				ID:                 "favorite-expired-idea",
+				SourceSuggestionID: "plan-walk",
+				Title:              validRemovedFavorite.Title,
+				Details:            validRemovedFavorite.Details,
+				Category:           validRemovedFavorite.Category,
+				SavedAt:            validRemovedFavorite.SavedAt,
+			},
+			revision:  7,
+			wantError: errThoughtfulFavoriteAlreadyExists,
+		},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			state := thoughtfulFavoriteStorageState(false)
+			database := sql.OpenDB(entryStateStorageConnector{state: state})
+			t.Cleanup(func() {
+				if err := database.Close(); err != nil {
+					t.Errorf("close thoughtful favorite storage database: %v", err)
+				}
+			})
+
+			_, err := restoreThoughtfulFavorite(
+				context.Background(),
+				database,
+				"thoughtful",
+				weeklyThoughtfulSuggestionsContentType,
+				test.favorite,
+				test.revision,
+			)
+			if !errors.Is(err, test.wantError) {
+				t.Fatalf("restoreThoughtfulFavorite() error = %v, want %v", err, test.wantError)
+			}
+			if state.updateQuery != "" {
+				t.Fatalf("update query = %q, want no save for rejected restore", state.updateQuery)
+			}
+		})
+	}
+}
+
+// TestRestoreThoughtfulFavoriteRejectsIncompleteRecord verifies that storage
+// refuses malformed Undo data before it reads or writes the area document. A
+// future HTTP route must provide the complete record remove returned, rather
+// than a display-only subset that could silently erase durable fields.
+func TestRestoreThoughtfulFavoriteRejectsIncompleteRecord(t *testing.T) {
+	state := thoughtfulFavoriteStorageState(false)
+	database := sql.OpenDB(entryStateStorageConnector{state: state})
+	t.Cleanup(func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("close thoughtful favorite storage database: %v", err)
+		}
+	})
+
+	_, err := restoreThoughtfulFavorite(
+		context.Background(),
+		database,
+		"thoughtful",
+		weeklyThoughtfulSuggestionsContentType,
+		thoughtfulFavorite{
+			ID:                 "favorite-expired-idea",
+			SourceSuggestionID: "expired-suggestion",
+			Title:              "Bring home her favorite pastry",
+			Details:            "Pick one up on the way home after her long meeting.",
+			Category:           "care",
+			// SavedAt is deliberately missing, as it would be in an incomplete
+			// display-only Undo payload rather than a complete durable record.
+		},
+		7,
+	)
+	if err == nil || !strings.Contains(err.Error(), "saved_at must be a YYYY-MM-DD date") {
+		t.Fatalf("restoreThoughtfulFavorite() error = %v, want invalid saved_at error", err)
+	}
+	if state.readQuery != "" || state.updateQuery != "" {
+		t.Fatalf("storage queries = read %q, update %q; want no query for malformed record", state.readQuery, state.updateQuery)
+	}
+}
+
+// TestThoughtfulFavoriteMutationsReportExpectedErrors covers normal stale and
+// duplicate interactions. Each case also records whether SQL reached the final
+// UPDATE, distinguishing a pre-save validation result from a true write race.
+func TestThoughtfulFavoriteMutationsReportExpectedErrors(t *testing.T) {
+	tests := []struct {
+		name          string
+		operation     string
+		areaID        string
+		contentType   string
+		itemID        string
+		revision      int
+		state         *entryStateStorageState
+		wantError     error
+		wantUpdateSQL bool
+	}{
+		{
+			name:        "unsupported document",
+			operation:   "add",
+			areaID:      "meals",
+			contentType: "weekly_meal_recommendations",
+			itemID:      "leave-note",
+			revision:    7,
+			state:       &entryStateStorageState{},
+			wantError:   errThoughtfulFavoriteNotConfigured,
+		},
+		{
+			name:        "missing thoughtful document",
+			operation:   "add",
+			areaID:      "thoughtful",
+			contentType: weeklyThoughtfulSuggestionsContentType,
+			itemID:      "leave-note",
+			revision:    7,
+			state:       &entryStateStorageState{},
+			wantError:   errThoughtfulFavoriteNotConfigured,
+		},
+		{
+			name:        "browser revision is stale before add",
+			operation:   "add",
+			areaID:      "thoughtful",
+			contentType: weeklyThoughtfulSuggestionsContentType,
+			itemID:      "leave-note",
+			revision:    6,
+			state:       thoughtfulFavoriteStorageState(false),
+			wantError:   errThoughtfulFavoriteRevisionConflict,
+		},
+		{
+			name:        "source suggestion is missing",
+			operation:   "add",
+			areaID:      "thoughtful",
+			contentType: weeklyThoughtfulSuggestionsContentType,
+			itemID:      "replaced-suggestion",
+			revision:    7,
+			state:       thoughtfulFavoriteStorageState(false),
+			wantError:   errThoughtfulSuggestionNotFound,
+		},
+		{
+			name:        "source suggestion is already a favorite",
+			operation:   "add",
+			areaID:      "thoughtful",
+			contentType: weeklyThoughtfulSuggestionsContentType,
+			itemID:      "plan-walk",
+			revision:    7,
+			state:       thoughtfulFavoriteStorageState(false),
+			wantError:   errThoughtfulFavoriteAlreadyExists,
+		},
+		{
+			name:        "favorite is already absent",
+			operation:   "remove",
+			areaID:      "thoughtful",
+			contentType: weeklyThoughtfulSuggestionsContentType,
+			itemID:      "favorite-missing",
+			revision:    7,
+			state:       thoughtfulFavoriteStorageState(false),
+			wantError:   errThoughtfulFavoriteNotFound,
+		},
+		{
+			name:        "browser revision is stale before remove",
+			operation:   "remove",
+			areaID:      "thoughtful",
+			contentType: weeklyThoughtfulSuggestionsContentType,
+			itemID:      "favorite-walk",
+			revision:    6,
+			state:       thoughtfulFavoriteStorageState(false),
+			wantError:   errThoughtfulFavoriteRevisionConflict,
+		},
+		{
+			name:          "another writer wins during conditional add",
+			operation:     "add",
+			areaID:        "thoughtful",
+			contentType:   weeklyThoughtfulSuggestionsContentType,
+			itemID:        "leave-note",
+			revision:      7,
+			state:         thoughtfulFavoriteStorageState(true),
+			wantError:     errThoughtfulFavoriteRevisionConflict,
+			wantUpdateSQL: true,
+		},
+		{
+			name:          "another writer wins during conditional remove",
+			operation:     "remove",
+			areaID:        "thoughtful",
+			contentType:   weeklyThoughtfulSuggestionsContentType,
+			itemID:        "favorite-walk",
+			revision:      7,
+			state:         thoughtfulFavoriteStorageState(true),
+			wantError:     errThoughtfulFavoriteRevisionConflict,
+			wantUpdateSQL: true,
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			database := sql.OpenDB(entryStateStorageConnector{state: test.state})
+			t.Cleanup(func() {
+				if err := database.Close(); err != nil {
+					t.Errorf("close thoughtful favorite storage database: %v", err)
+				}
+			})
+
+			var err error
+			if test.operation == "remove" {
+				_, err = removeThoughtfulFavorite(
+					context.Background(),
+					database,
+					test.areaID,
+					test.contentType,
+					test.itemID,
+					test.revision,
+				)
+			} else {
+				_, err = addThoughtfulFavorite(
+					context.Background(),
+					database,
+					test.areaID,
+					test.contentType,
+					test.itemID,
+					test.revision,
+					time.Date(2026, time.August, 20, 12, 0, 0, 0, time.UTC),
+				)
+			}
+			if !errors.Is(err, test.wantError) {
+				t.Fatalf("thoughtful favorite mutation error = %v, want %v", err, test.wantError)
+			}
+			if gotUpdateSQL := test.state.updateQuery != ""; gotUpdateSQL != test.wantUpdateSQL {
+				t.Fatalf("update executed = %t, want %t", gotUpdateSQL, test.wantUpdateSQL)
+			}
+		})
+	}
+}
+
+// thoughtfulSuggestionsStorageFixture models the visible five-card week plus
+// one older durable Favorite. plan-walk deliberately remains both a current
+// suggestion and the favorite's source, exercising the post-save UI state where
+// a weekly card shows a filled heart until the next refresh.
+func thoughtfulSuggestionsStorageFixture() string {
+	return `{"week_starting":"2026-07-26","suggestions":[` +
+		`{"id":"leave-note","title":"Leave a note by her coffee","details":"Mention one specific thing you appreciate.","category":"encouragement"},` +
+		`{"id":"plan-walk","title":"Plan a short walk","details":"Choose an easy route after dinner.","category":"quality time"},` +
+		`{"id":"handle-dishes","title":"Handle the dishes","details":"Take care of cleanup before she needs to ask.","category":"practical help"},` +
+		`{"id":"send-message","title":"Send a midday message","details":"Share one warm and specific thought.","category":"affection"},` +
+		`{"id":"make-tea","title":"Make her favorite tea","details":"Bring it while she is reading.","category":"care"}` +
+		`],"favorites":[` +
+		`{"id":"favorite-walk","source_suggestion_id":"plan-walk","title":"Plan a short walk","details":"Choose an easy route after dinner.","category":"quality time","saved_at":"2026-07-12"}` +
+		`]}`
+}
+
+// thoughtfulFavoriteStorageState creates an isolated in-memory area_content row
+// for expected-error cases. The optional conflict flag models a weekly refresh
+// winning after the favorite operation's initial read.
+func thoughtfulFavoriteStorageState(forceRevisionConflict bool) *entryStateStorageState {
+	return &entryStateStorageState{
+		documents: map[string]entryStateStorageRow{
+			entryStateStorageKey("thoughtful", weeklyThoughtfulSuggestionsContentType): {
+				content:   thoughtfulSuggestionsStorageFixture(),
+				revision:  7,
+				updatedAt: time.Date(2026, time.July, 26, 10, 30, 0, 0, time.UTC),
+			},
+		},
+		forceRevisionConflict: forceRevisionConflict,
+	}
+}
+
 // TestSaveAreaEntryStateChangesOnlyOneRawEntryField exercises the completion
 // path without a live database. The fixture includes fields that the current UI
 // does not need so this test guards the important storage promise: changing a
@@ -725,9 +1275,10 @@ func entryStateFixtureDocument() entryStateStorageRow {
 	}
 }
 
-// entryStateStorageState is an in-memory area_content table for this feature's
-// storage and HTTP tests. It records SQL so tests verify the revision predicate
-// and the deliberate boundary that entry state does not change updated_at.
+// entryStateStorageState began as the entry-state test table and now supplies
+// the same area_content read/conditional-write behavior to favorite tests. It
+// records SQL so both mutation families can verify their revision predicate and
+// the deliberate boundary that small interactions do not change updated_at.
 type entryStateStorageState struct {
 	documents             map[string]entryStateStorageRow
 	readQuery             string
@@ -801,9 +1352,9 @@ func (connection *entryStateStorageConnection) QueryContext(
 		return connection.loadAreaContent(query, arguments)
 	}
 	if strings.Contains(query, "UPDATE personal_ai.area_content") {
-		return connection.saveAreaEntryState(query, arguments)
+		return connection.saveAreaContentMutation(query, arguments)
 	}
-	return nil, errors.New("entry-state storage test driver received an unexpected query")
+	return nil, errors.New("area-content mutation test driver received an unexpected query")
 }
 
 func (connection *entryStateStorageConnection) loadAreaContent(
@@ -832,19 +1383,22 @@ func (connection *entryStateStorageConnection) loadAreaContent(
 	}}}, nil
 }
 
-func (connection *entryStateStorageConnection) saveAreaEntryState(
+// saveAreaContentMutation models the shared four-argument conditional UPDATE
+// used by entry-state and favorite writes. The production functions remain
+// separate; only their identical database behavior is shared by this test double.
+func (connection *entryStateStorageConnection) saveAreaContentMutation(
 	query string,
 	arguments []driver.NamedValue,
 ) (driver.Rows, error) {
 	if len(arguments) != 4 {
-		return nil, errors.New("entry-state storage save must receive four arguments")
+		return nil, errors.New("area-content mutation save must receive four arguments")
 	}
 	areaID, areaIDOK := arguments[0].Value.(string)
 	contentType, contentTypeOK := arguments[1].Value.(string)
 	contentJSON, contentJSONOK := arguments[2].Value.(string)
 	revision, revisionOK := arguments[3].Value.(int64)
 	if !areaIDOK || !contentTypeOK || !contentJSONOK || !revisionOK {
-		return nil, errors.New("entry-state storage save arguments have unexpected types")
+		return nil, errors.New("area-content mutation save arguments have unexpected types")
 	}
 
 	connection.state.updateQuery = strings.Join(strings.Fields(query), " ")

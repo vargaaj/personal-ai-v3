@@ -1,7 +1,8 @@
 // area_content_validation.go defines the trusted Go representations and local
-// validation boundary for generated Home, Health, and Meals documents. updater.go
-// owns calling this boundary after OpenRouter responds; this file deliberately
-// contains no scheduling, retries, storage, or network orchestration.
+// validation boundary for generated Home, Health, Meals, and Thoughtful
+// Suggestions documents. updater.go owns calling this boundary after OpenRouter
+// responds; this file deliberately contains no scheduling, retries, storage, or
+// network orchestration.
 //
 // The types below mirror the JSON Schemas in response_formats.go. Decoding into
 // named fields, with unknown fields rejected, gives the save path an independent
@@ -157,6 +158,41 @@ type weeklyMealRecommendation struct {
 	Tags        *[]string `json:"tags"`
 }
 
+// weeklyThoughtfulSuggestionsDocument keeps the replaceable weekly ideas and
+// the person's durable Favorites in one database document. A refresh may replace
+// Suggestions, but Favorites must be copied exactly so a model-generated update
+// can never erase or silently rewrite something the person intentionally saved.
+type weeklyThoughtfulSuggestionsDocument struct {
+	WeekStarting string                 `json:"week_starting"`
+	Suggestions  []weeklyThoughtfulIdea `json:"suggestions"`
+	Favorites    []thoughtfulFavorite   `json:"favorites"`
+}
+
+// weeklyThoughtfulIdea is one small action shown in the current week's list.
+// Category is intentionally plain text rather than a fixed enum so the saved
+// prompt can suggest context-appropriate groupings such as encouragement,
+// practical help, quality time, or affection without requiring a deployment.
+type weeklyThoughtfulIdea struct {
+	ID       string `json:"id"`
+	Title    string `json:"title"`
+	Details  string `json:"details"`
+	Category string `json:"category"`
+}
+
+// thoughtfulFavorite is the durable copy created when a person favorites one
+// weekly suggestion. SourceSuggestionID preserves which suggestion created the
+// saved record, even when a later refresh replaces the weekly list. SavedAt
+// records when it entered Favorites; retaining the suggestion's other fields
+// makes the saved idea useful even after the weekly source list has changed.
+type thoughtfulFavorite struct {
+	ID                 string `json:"id"`
+	SourceSuggestionID string `json:"source_suggestion_id"`
+	Title              string `json:"title"`
+	Details            string `json:"details"`
+	Category           string `json:"category"`
+	SavedAt            string `json:"saved_at"`
+}
+
 // validateGeneratedJSON chooses the trusted local validation boundary that
 // matches the request sent to OpenRouter. A structured response is checked
 // against its stable document contract rather than compared with legacy stored
@@ -182,6 +218,8 @@ func validateGeneratedJSON(
 		return validateWeeklyWorkoutRoutineJSON(updatedJSON, now)
 	case weeklyMealRecommendationsContentType:
 		return validateWeeklyMealRecommendationsJSON(updatedJSON, now)
+	case weeklyThoughtfulSuggestionsContentType:
+		return validateWeeklyThoughtfulSuggestionsJSON(originalJSON, updatedJSON, now)
 	default:
 		return validateJSONStructure(originalJSON, updatedJSON)
 	}
@@ -647,6 +685,228 @@ func validateWeeklyMealRecommendationsJSON(updatedJSON string, now time.Time) er
 		}
 	}
 
+	return nil
+}
+
+// validateWeeklyThoughtfulSuggestionsJSON protects the boundary between weekly
+// generation and durable favorites. Both documents receive full shape checks;
+// the generated week must match the runner's requested Sunday, and the Favorites
+// array must remain field-for-field and order-for-order identical to storage.
+// Called by validateGeneratedJSON for weekly_thoughtful_suggestions documents.
+func validateWeeklyThoughtfulSuggestionsJSON(
+	originalJSON string,
+	updatedJSON string,
+	now time.Time,
+) error {
+	var original weeklyThoughtfulSuggestionsDocument
+	if err := decodeStrictJSONDocument(
+		"original weekly thoughtful suggestions",
+		originalJSON,
+		&original,
+	); err != nil {
+		return err
+	}
+	if err := validateWeeklyThoughtfulSuggestionsDocument(
+		"original weekly thoughtful suggestions",
+		original,
+		"",
+	); err != nil {
+		return err
+	}
+
+	var updated weeklyThoughtfulSuggestionsDocument
+	if err := decodeStrictJSONDocument("weekly thoughtful suggestions", updatedJSON, &updated); err != nil {
+		return err
+	}
+	expectedWeekStart := startOfSundayWeek(now).Format("2006-01-02")
+	if err := validateWeeklyThoughtfulSuggestionsDocument(
+		"weekly thoughtful suggestions",
+		updated,
+		expectedWeekStart,
+	); err != nil {
+		return err
+	}
+	if err := validateGeneratedThoughtfulSuggestionIDs(updated.Suggestions, original.Favorites); err != nil {
+		return err
+	}
+
+	// DeepEqual compares every favorite and its array position after strict JSON
+	// decoding. JSON whitespace and object-key order may differ, while the saved
+	// idea, category, saved date, and deliberate ordering may not.
+	if !reflect.DeepEqual(updated.Favorites, original.Favorites) {
+		return errors.New("weekly thoughtful suggestions must preserve favorites unchanged")
+	}
+
+	return nil
+}
+
+// validateGeneratedThoughtfulSuggestionIDs keeps this refresh's replacement
+// list separate from the sources of durable Favorites. A favorite may point to
+// an ID in the original stored Suggestions list, but the generator must not
+// reuse that source ID for a new weekly suggestion. This check runs only for
+// generated output after both documents have passed their independent shape
+// checks and before the exact Favorites preservation comparison.
+func validateGeneratedThoughtfulSuggestionIDs(
+	suggestions []weeklyThoughtfulIdea,
+	preservedFavorites []thoughtfulFavorite,
+) error {
+	preservedFavoriteSources := make(map[string]string, len(preservedFavorites))
+	for index, favorite := range preservedFavorites {
+		preservedFavoriteSources[favorite.SourceSuggestionID] = fmt.Sprintf("favorite %d", index+1)
+	}
+
+	for index, suggestion := range suggestions {
+		if favoriteLocation, isPreservedSource := preservedFavoriteSources[suggestion.ID]; isPreservedSource {
+			return fmt.Errorf(
+				"generated weekly thoughtful suggestion %d reuses preserved favorite source_suggestion_id %q from %s",
+				index+1,
+				suggestion.ID,
+				favoriteLocation,
+			)
+		}
+	}
+
+	return nil
+}
+
+// validateWeeklyThoughtfulSuggestionsDocument checks one stored or generated
+// document. expectedWeekStart is blank for existing stored content because an
+// older week is legitimate input; generated content passes the current target
+// Sunday and must match it exactly before it can replace that input.
+func validateWeeklyThoughtfulSuggestionsDocument(
+	documentName string,
+	document weeklyThoughtfulSuggestionsDocument,
+	expectedWeekStart string,
+) error {
+	weekStart, err := time.Parse("2006-01-02", document.WeekStarting)
+	if err != nil {
+		return fmt.Errorf("%s week_starting must be a YYYY-MM-DD date: %w", documentName, err)
+	}
+	if weekStart.Weekday() != time.Sunday {
+		return fmt.Errorf("%s week_starting must be a Sunday, got %s", documentName, weekStart.Weekday())
+	}
+	if expectedWeekStart != "" && document.WeekStarting != expectedWeekStart {
+		return fmt.Errorf(
+			"%s week_starting must equal target week %s, got %q",
+			documentName,
+			expectedWeekStart,
+			document.WeekStarting,
+		)
+	}
+
+	// A missing or null JSON property also decodes to a nil slice. Requiring a
+	// real array makes the storage contract unambiguous, including when Favorites
+	// is intentionally empty and represented as `[]`.
+	if document.Suggestions == nil {
+		return fmt.Errorf("%s suggestions must be an array", documentName)
+	}
+	if len(document.Suggestions) != 5 {
+		return fmt.Errorf(
+			"%s must contain exactly 5 suggestions, got %d",
+			documentName,
+			len(document.Suggestions),
+		)
+	}
+	if document.Favorites == nil {
+		return fmt.Errorf("%s favorites must be an array", documentName)
+	}
+
+	// IDs are document-wide identities because the favorite action addresses a
+	// source suggestion and later renders the saved copy in a separate section.
+	// Preventing duplicates avoids ambiguous requests and duplicate React keys.
+	seenIDs := make(map[string]string, len(document.Suggestions)+len(document.Favorites))
+	for index, suggestion := range document.Suggestions {
+		itemName := fmt.Sprintf("%s suggestion %d", documentName, index+1)
+		if err := validateThoughtfulIdeaFields(
+			itemName,
+			suggestion.ID,
+			suggestion.Title,
+			suggestion.Details,
+			suggestion.Category,
+		); err != nil {
+			return err
+		}
+		if previousLocation, duplicate := seenIDs[suggestion.ID]; duplicate {
+			return fmt.Errorf("%s repeats id %q from %s", itemName, suggestion.ID, previousLocation)
+		}
+		seenIDs[suggestion.ID] = itemName
+	}
+
+	// A source may legitimately be one of this week's suggestion IDs: a person
+	// can save a currently visible idea. Only duplicate source references among
+	// Favorites are invalid because two saved records for one suggestion would
+	// make the favorite action and resulting list ambiguous.
+	seenFavoriteSourceIDs := make(map[string]string, len(document.Favorites))
+	for index, favorite := range document.Favorites {
+		itemName := fmt.Sprintf("%s favorite %d", documentName, index+1)
+		if err := validateThoughtfulIdeaFields(
+			itemName,
+			favorite.ID,
+			favorite.Title,
+			favorite.Details,
+			favorite.Category,
+		); err != nil {
+			return err
+		}
+		if err := validateThoughtfulFavoriteSourceID(itemName, favorite.SourceSuggestionID); err != nil {
+			return err
+		}
+		if _, err := time.Parse("2006-01-02", favorite.SavedAt); err != nil {
+			return fmt.Errorf("%s saved_at must be a YYYY-MM-DD date: %w", itemName, err)
+		}
+		if previousLocation, duplicate := seenIDs[favorite.ID]; duplicate {
+			return fmt.Errorf("%s repeats id %q from %s", itemName, favorite.ID, previousLocation)
+		}
+		seenIDs[favorite.ID] = itemName
+		if previousLocation, duplicate := seenFavoriteSourceIDs[favorite.SourceSuggestionID]; duplicate {
+			return fmt.Errorf(
+				"%s repeats source_suggestion_id %q from %s",
+				itemName,
+				favorite.SourceSuggestionID,
+				previousLocation,
+			)
+		}
+		seenFavoriteSourceIDs[favorite.SourceSuggestionID] = itemName
+	}
+
+	return nil
+}
+
+// validateThoughtfulFavoriteSourceID ensures a saved favorite has a literal
+// reference to its source suggestion. Treating the value like an ID prevents
+// invisible whitespace from creating two source references that look identical
+// in the Favorites interface.
+func validateThoughtfulFavoriteSourceID(itemName string, sourceSuggestionID string) error {
+	trimmedSourceSuggestionID := strings.TrimSpace(sourceSuggestionID)
+	if trimmedSourceSuggestionID == "" {
+		return fmt.Errorf("%s source_suggestion_id is required", itemName)
+	}
+	if sourceSuggestionID != trimmedSourceSuggestionID {
+		return fmt.Errorf("%s source_suggestion_id must not have leading or trailing whitespace", itemName)
+	}
+	return nil
+}
+
+// validateThoughtfulIdeaFields applies the shared text and identity rules to a
+// current-week suggestion and its durable favorite representation. IDs remain
+// literal so whitespace cannot create two visually indistinguishable entries.
+func validateThoughtfulIdeaFields(itemName string, id string, title string, details string, category string) error {
+	trimmedID := strings.TrimSpace(id)
+	if trimmedID == "" {
+		return fmt.Errorf("%s id is required", itemName)
+	}
+	if id != trimmedID {
+		return fmt.Errorf("%s id must not have leading or trailing whitespace", itemName)
+	}
+	if strings.TrimSpace(title) == "" {
+		return fmt.Errorf("%s title is required", itemName)
+	}
+	if strings.TrimSpace(details) == "" {
+		return fmt.Errorf("%s details are required", itemName)
+	}
+	if strings.TrimSpace(category) == "" {
+		return fmt.Errorf("%s category is required", itemName)
+	}
 	return nil
 }
 

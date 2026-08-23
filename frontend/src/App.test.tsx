@@ -12,35 +12,111 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import ReviewApp from "./App";
 import {
+  addThoughtfulFavorite,
   fetchAreaContentPrompt,
   fetchReviewAreaSnapshot,
+  removeThoughtfulFavorite,
   requestAreaContentUpdate,
   requestWeeklyAreaUpdate,
   saveAreaContentPrompt,
   saveAreaEntryState,
 } from "./data/areaContentApi";
+import type { ReviewArea } from "./domain/review";
 import { initialAreas } from "./fixtures/reviewAreas";
 
 // The adapter has its own tests for translating real Go response shapes. These
 // component tests replace only the network boundary with resolved domain data,
 // keeping interaction coverage deterministic and independent of Supabase.
 vi.mock("./data/areaContentApi", () => ({
+  addThoughtfulFavorite: vi.fn(),
   fetchAreaContentPrompt: vi.fn(),
   fetchReviewAreaSnapshot: vi.fn(),
+  removeThoughtfulFavorite: vi.fn(),
   requestAreaContentUpdate: vi.fn(),
   requestWeeklyAreaUpdate: vi.fn(),
   saveAreaContentPrompt: vi.fn(),
   saveAreaEntryState: vi.fn(),
 }));
 
+const addThoughtfulFavoriteMock = vi.mocked(addThoughtfulFavorite);
 const fetchAreaContentPromptMock = vi.mocked(fetchAreaContentPrompt);
 const fetchReviewAreaSnapshotMock = vi.mocked(fetchReviewAreaSnapshot);
+const removeThoughtfulFavoriteMock = vi.mocked(removeThoughtfulFavorite);
 const requestAreaContentUpdateMock = vi.mocked(requestAreaContentUpdate);
 const requestWeeklyAreaUpdateMock = vi.mocked(requestWeeklyAreaUpdate);
 const saveAreaContentPromptMock = vi.mocked(saveAreaContentPrompt);
 const saveAreaEntryStateMock = vi.mocked(saveAreaEntryState);
 
+// This small domain-shaped document exercises the five weekly-card contract,
+// one existing durable Favorite, and the revision needed by conditional heart
+// writes. It stays local to App tests so adapter translation remains covered by
+// areaContentApi.test.ts rather than being duplicated in component fixtures.
+const thoughtfulArea: ReviewArea = {
+  id: "thoughtful",
+  name: "Thoughtful Suggestions",
+  description: "Small, caring gestures for this week and the favorites worth keeping.",
+  accent: "rose",
+  entries: [],
+  thoughtfulSuggestions: {
+    weekStarting: "2026-08-16",
+    revision: 7,
+    suggestions: [
+      { id: "suggestion-1", title: "Pack her favorite lunch", details: "Add a note before her busy afternoon.", category: "care" },
+      { id: "suggestion-2", title: "Send an encouraging voice note", details: "Mention the presentation she has been preparing.", category: "encouragement" },
+      { id: "suggestion-3", title: "Plan a quiet walk", details: "Choose the tree-lined route after dinner.", category: "quality time" },
+      { id: "suggestion-4", title: "Bring home fresh flowers", details: "Pick the small bunch she paused to admire.", category: "care" },
+      { id: "suggestion-5", title: "Start a shared playlist", details: "Add one song from the concert you both enjoyed.", category: "connection" },
+    ],
+    favorites: [
+      {
+        id: "favorite-1",
+        sourceSuggestionId: "older-suggestion",
+        title: "Make her Saturday coffee",
+        details: "Set out the mug she likes before she wakes up.",
+        category: "care",
+        savedAt: "2026-08-18",
+      },
+    ],
+  },
+};
+
+// Adapter order places Thoughtful directly after Meals. Retaining the other
+// fixture areas makes this order observable in the existing navigation shell.
+const areasWithThoughtful: ReviewArea[] = [
+  ...initialAreas.filter((area) => area.id !== "money"),
+  thoughtfulArea,
+  ...initialAreas.filter((area) => area.id === "money"),
+];
+
 beforeEach(() => {
+  addThoughtfulFavoriteMock.mockReset();
+  addThoughtfulFavoriteMock.mockImplementation(async (sourceSuggestionId, _revision) => ({
+    areaId: "thoughtful",
+    contentType: "weekly_thoughtful_suggestions",
+    favorite: {
+      id: `favorite-${sourceSuggestionId}`,
+      sourceSuggestionId,
+      title: "Server Favorite",
+      details: "Confirmed by the server.",
+      category: "care",
+      savedAt: "2026-08-21",
+    },
+    revision: 8,
+  }));
+  removeThoughtfulFavoriteMock.mockReset();
+  removeThoughtfulFavoriteMock.mockImplementation(async (favoriteId, _revision) => ({
+    areaId: "thoughtful",
+    contentType: "weekly_thoughtful_suggestions",
+    favorite: {
+      id: favoriteId,
+      sourceSuggestionId: "older-suggestion",
+      title: "Make her Saturday coffee",
+      details: "Set out the mug she likes before she wakes up.",
+      category: "care",
+      savedAt: "2026-08-18",
+    },
+    revision: 8,
+  }));
   fetchReviewAreaSnapshotMock.mockReset();
   fetchReviewAreaSnapshotMock.mockResolvedValue({
     areas: initialAreas,
@@ -130,6 +206,15 @@ async function renderReview() {
   // populated React state, matching how a person waits for the screen to load.
   await screen.findByRole("heading", { name: "Mail" });
   return user;
+}
+
+/** Renders the normal shell with Thoughtful inserted in its adapter display order. */
+async function renderThoughtfulReview() {
+  fetchReviewAreaSnapshotMock.mockResolvedValue({
+    areas: areasWithThoughtful,
+    updatedAtByArea: { thoughtful: "2026-08-21T12:00:00Z" },
+  });
+  return renderReview();
 }
 
 describe("ReviewApp", () => {
@@ -786,6 +871,359 @@ describe("ReviewApp", () => {
     expect(
       screen.getByRole("button", { name: "Restore Archive last week's household newsletter" }),
     ).toBeInTheDocument();
+  });
+
+  it("renders Thoughtful browse-and-save cards in navigation order without task controls or refresh actions", async () => {
+    await renderThoughtfulReview();
+
+    // The sidebar follows the adapter's order: Thoughtful is immediately after
+    // Meals and has no misleading "0 open" task count.
+    const navigationLabels = within(screen.getByRole("navigation", { name: "Review areas" }))
+      .getAllByRole("button")
+      .map((button) => button.textContent);
+    expect(navigationLabels).toEqual(expect.arrayContaining(["Meals2", "Thoughtful Suggestions", "Money1"]));
+    expect(navigationLabels.indexOf("Meals2")).toBeLessThan(navigationLabels.indexOf("Thoughtful Suggestions"));
+    expect(navigationLabels.indexOf("Thoughtful Suggestions")).toBeLessThan(navigationLabels.indexOf("Money1"));
+
+    const thoughtfulRegion = screen.getByRole("region", { name: "Thoughtful Suggestions" });
+    expect(within(thoughtfulRegion).getByRole("heading", { name: "This Week" })).toBeInTheDocument();
+    expect(within(thoughtfulRegion).getByRole("heading", { name: "Favorites" })).toBeInTheDocument();
+    expect(within(thoughtfulRegion).getByText("Add a note before her busy afternoon.")).toBeInTheDocument();
+    // The Favorite card separates the visible labels from their values with a
+    // nested <b>, so query the semantic card and inspect its combined text
+    // instead of asking Testing Library to find one split text node.
+    const saturdayCoffeeCard = within(thoughtfulRegion)
+      .getByRole("heading", { name: "Make her Saturday coffee" })
+      .closest("article") as HTMLElement;
+    expect(saturdayCoffeeCard).toBeInTheDocument();
+    expect(saturdayCoffeeCard).toHaveTextContent("Category care");
+    expect(saturdayCoffeeCard).toHaveTextContent("Saved 2026-08-18");
+    expect(within(thoughtfulRegion).queryByRole("button", { name: /^(Mark|Restore) / })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Edit Thoughtful Suggestions prompt" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Refresh Thoughtful Suggestions" })).not.toBeInTheDocument();
+  });
+
+  it("searches weekly cards and Favorites while task status filters leave Thoughtful visible", async () => {
+    const user = await renderThoughtfulReview();
+    const search = screen.getByRole("searchbox", { name: "Search entries" });
+
+    await user.type(search, "tree-lined");
+    expect(screen.getByRole("heading", { name: "Plan a quiet walk" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Done" }));
+    expect(screen.getByRole("heading", { name: "Plan a quiet walk" })).toBeInTheDocument();
+
+    await user.clear(search);
+    await user.type(search, "2026-08-18");
+    expect(screen.getByRole("heading", { name: "Make her Saturday coffee" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "No entries match this view." })).not.toBeInTheDocument();
+  });
+
+  it("uses an unfiltered Favorite to remove a weekly card whose saved fields miss the query", async () => {
+    // The weekly idea matches "tree-lined", while its saved copy deliberately
+    // does not. The weekly card must still display a pressed Remove action even
+    // though the filtered Favorites section cannot display that saved copy.
+    const areaWithMismatchedFavorite: ReviewArea = {
+      ...thoughtfulArea,
+      thoughtfulSuggestions: {
+        ...thoughtfulArea.thoughtfulSuggestions!,
+        favorites: [{
+          ...thoughtfulArea.thoughtfulSuggestions!.favorites[0]!,
+          sourceSuggestionId: "suggestion-3",
+          title: "Make her Saturday coffee",
+          details: "Set out the mug she likes before she wakes up.",
+        }],
+      },
+    };
+    fetchReviewAreaSnapshotMock.mockResolvedValueOnce({
+      areas: [
+        ...initialAreas.filter((area) => area.id !== "money"),
+        areaWithMismatchedFavorite,
+        ...initialAreas.filter((area) => area.id === "money"),
+      ],
+      updatedAtByArea: { thoughtful: "2026-08-21T12:00:00Z" },
+    });
+
+    const user = await renderReview();
+    const search = screen.getByRole("searchbox", { name: "Search entries" });
+    await user.type(search, "tree-lined");
+
+    const weeklyHeart = screen.getByRole("button", {
+      name: "Remove Plan a quiet walk from Favorites",
+    });
+    expect(weeklyHeart).toHaveAttribute("aria-pressed", "true");
+
+    await user.click(weeklyHeart);
+    expect(removeThoughtfulFavoriteMock).toHaveBeenCalledWith("favorite-1", 7);
+  });
+
+  it("optimistically adds a Favorite, locks every heart, and uses the returned revision for removal", async () => {
+    let finishAdd: (value: Awaited<ReturnType<typeof addThoughtfulFavorite>>) => void = () => {};
+    addThoughtfulFavoriteMock.mockReturnValueOnce(
+      new Promise((resolve) => {
+        finishAdd = resolve;
+      }),
+    );
+    const user = await renderThoughtfulReview();
+    const thoughtfulRegion = screen.getByRole("region", { name: "Thoughtful Suggestions" });
+    const weeklyRegion = within(thoughtfulRegion).getByRole("region", { name: "This Week" });
+    const addHeart = within(weeklyRegion).getByRole("button", {
+      name: "Add Pack her favorite lunch to Favorites",
+    });
+
+    await user.click(addHeart);
+    expect(addThoughtfulFavoriteMock).toHaveBeenCalledWith("suggestion-1", 7);
+    expect(addHeart).toHaveAttribute("aria-pressed", "true");
+    expect(addHeart).toHaveAttribute("aria-busy", "true");
+    expect(
+      within(weeklyRegion).getByRole("button", { name: "Remove Pack her favorite lunch from Favorites" }),
+    ).toBeDisabled();
+    await user.click(within(weeklyRegion).getByRole("button", {
+      name: "Add Send an encouraging voice note to Favorites",
+    }));
+    expect(addThoughtfulFavoriteMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      finishAdd({
+        areaId: "thoughtful",
+        contentType: "weekly_thoughtful_suggestions",
+        favorite: {
+          id: "favorite-server-1",
+          sourceSuggestionId: "suggestion-1",
+          title: "Server-saved lunch",
+          details: "Complete text returned by Go.",
+          category: "care",
+          savedAt: "2026-08-21",
+        },
+        revision: 8,
+      });
+    });
+
+    expect(await screen.findByRole("heading", { name: "Server-saved lunch" })).toBeInTheDocument();
+    await user.click(within(weeklyRegion).getByRole("button", {
+      name: "Remove Pack her favorite lunch from Favorites",
+    }));
+    expect(removeThoughtfulFavoriteMock).toHaveBeenCalledWith("favorite-server-1", 8);
+  });
+
+  it("upserts a successful add after a whole-snapshot reload removed its optimistic Favorite", async () => {
+    let finishAdd: (value: Awaited<ReturnType<typeof addThoughtfulFavorite>>) => void = () => {};
+    addThoughtfulFavoriteMock.mockReturnValueOnce(
+      new Promise((resolve) => {
+        finishAdd = resolve;
+      }),
+    );
+    fetchReviewAreaSnapshotMock
+      .mockReset()
+      .mockResolvedValueOnce({
+        areas: areasWithThoughtful,
+        updatedAtByArea: { thoughtful: "2026-08-21T12:00:00Z" },
+      })
+      // This reload intentionally contains no optimistic Favorite. It models
+      // another whole-snapshot request winning the render while PUT is pending.
+      .mockResolvedValueOnce({
+        areas: areasWithThoughtful,
+        updatedAtByArea: { thoughtful: "2026-08-21T12:10:00Z" },
+      });
+    requestAreaContentUpdateMock.mockResolvedValueOnce({
+      areaId: "home",
+      contentType: "maintenance_tasks",
+      status: "updated",
+      revision: 3,
+    });
+
+    const user = await renderReview();
+    await user.click(screen.getByRole("button", { name: "Add Pack her favorite lunch to Favorites" }));
+    await user.click(screen.getByRole("button", { name: "Refresh Home" }));
+    await waitFor(() => expect(fetchReviewAreaSnapshotMock).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      finishAdd({
+        areaId: "thoughtful",
+        contentType: "weekly_thoughtful_suggestions",
+        favorite: {
+          id: "favorite-reloaded-add",
+          sourceSuggestionId: "suggestion-1",
+          title: "Server-authoritative lunch",
+          details: "Returned after the concurrent reload.",
+          category: "care",
+          savedAt: "2026-08-21",
+        },
+        revision: 11,
+      });
+    });
+
+    expect(await screen.findByRole("heading", { name: "Server-authoritative lunch" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Remove Pack her favorite lunch from Favorites" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+  });
+
+  it("removes a Favorite reintroduced by a whole-snapshot reload and keeps the returned revision", async () => {
+    let finishRemove: (value: Awaited<ReturnType<typeof removeThoughtfulFavorite>>) => void = () => {};
+    removeThoughtfulFavoriteMock.mockReturnValueOnce(
+      new Promise((resolve) => {
+        finishRemove = resolve;
+      }),
+    );
+    fetchReviewAreaSnapshotMock
+      .mockReset()
+      .mockResolvedValueOnce({
+        areas: areasWithThoughtful,
+        updatedAtByArea: { thoughtful: "2026-08-21T12:00:00Z" },
+      })
+      // The reload reintroduces the saved card that the optimistic DELETE hid.
+      .mockResolvedValueOnce({
+        areas: areasWithThoughtful,
+        updatedAtByArea: { thoughtful: "2026-08-21T12:10:00Z" },
+      });
+    const user = await renderReview();
+
+    await user.click(screen.getByRole("button", { name: "Remove Make her Saturday coffee from Favorites" }));
+    await user.click(screen.getByRole("button", { name: "Refresh Home" }));
+    await waitFor(() => expect(fetchReviewAreaSnapshotMock).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      finishRemove({
+        areaId: "thoughtful",
+        contentType: "weekly_thoughtful_suggestions",
+        favorite: thoughtfulArea.thoughtfulSuggestions!.favorites[0]!,
+        revision: 12,
+      });
+    });
+
+    expect(screen.queryByRole("heading", { name: "Make her Saturday coffee" })).not.toBeInTheDocument();
+
+    // The next mutation proves the successful DELETE's revision replaced the
+    // reloaded revision rather than leaving the browser on an older snapshot.
+    await user.click(screen.getByRole("button", { name: "Add Pack her favorite lunch to Favorites" }));
+    expect(addThoughtfulFavoriteMock).toHaveBeenLastCalledWith("suggestion-1", 12);
+  });
+
+  it("reconciles a rejected removal from the authoritative snapshot without exposing private failures", async () => {
+    const authoritativeArea: ReviewArea = {
+      ...thoughtfulArea,
+      thoughtfulSuggestions: {
+        ...thoughtfulArea.thoughtfulSuggestions!,
+        revision: 9,
+        favorites: [{
+          id: "favorite-server-2",
+          sourceSuggestionId: "server-source",
+          title: "Authoritative Favorite",
+          details: "The server snapshot replaces local assumptions.",
+          category: "connection",
+          savedAt: "2026-08-21",
+        }],
+      },
+    };
+    fetchReviewAreaSnapshotMock
+      .mockResolvedValueOnce({ areas: areasWithThoughtful, updatedAtByArea: { thoughtful: "2026-08-21T12:00:00Z" } })
+      .mockResolvedValueOnce({ areas: [authoritativeArea], updatedAtByArea: { thoughtful: "2026-08-21T12:10:00Z" } });
+    removeThoughtfulFavoriteMock.mockRejectedValueOnce(new Error("private conflict details"));
+    const user = await renderReview();
+
+    await user.click(screen.getByRole("button", { name: "Remove Make her Saturday coffee from Favorites" }));
+    expect(screen.queryByRole("heading", { name: "Make her Saturday coffee" })).not.toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Authoritative Favorite" })).toBeInTheDocument();
+    expect(screen.getByText("Could not save that Favorite change. The latest saved Favorites are shown.")).toBeInTheDocument();
+    expect(screen.queryByText("private conflict details")).not.toBeInTheDocument();
+  });
+
+  it("restores the captured Favorite and revision when reconciliation also fails", async () => {
+    fetchReviewAreaSnapshotMock
+      .mockResolvedValueOnce({ areas: areasWithThoughtful, updatedAtByArea: { thoughtful: "2026-08-21T12:00:00Z" } })
+      .mockRejectedValueOnce(new Error("private snapshot failure"));
+    removeThoughtfulFavoriteMock
+      .mockRejectedValueOnce(new Error("private delete failure"))
+      .mockResolvedValueOnce({
+        areaId: "thoughtful",
+        contentType: "weekly_thoughtful_suggestions",
+        favorite: thoughtfulArea.thoughtfulSuggestions!.favorites[0]!,
+        revision: 8,
+      });
+    const user = await renderReview();
+    const removeHeart = screen.getByRole("button", { name: "Remove Make her Saturday coffee from Favorites" });
+
+    await user.click(removeHeart);
+    expect(await screen.findByText("Could not save that Favorite change. Your previous Favorites were restored.")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Make her Saturday coffee" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Remove Make her Saturday coffee from Favorites" }));
+    expect(removeThoughtfulFavoriteMock).toHaveBeenLastCalledWith("favorite-1", 7);
+  });
+
+  it("preserves a newer unrelated timestamp when Favorite rollback follows reload failure", async () => {
+    let rejectRemove: (reason?: unknown) => void = () => {};
+    removeThoughtfulFavoriteMock.mockReturnValueOnce(
+      new Promise((_resolve, reject) => {
+        rejectRemove = reject;
+      }),
+    );
+    fetchReviewAreaSnapshotMock
+      .mockReset()
+      .mockResolvedValueOnce({
+        areas: areasWithThoughtful,
+        updatedAtByArea: {
+          thoughtful: "2026-08-21T12:00:00Z",
+          home: "2026-08-21T11:00:00Z",
+        },
+      })
+      // A concurrent Home reload updates its own timestamp while the Favorite
+      // request is pending; the later rollback must not erase that change.
+      .mockResolvedValueOnce({
+        areas: areasWithThoughtful,
+        updatedAtByArea: {
+          thoughtful: "2026-08-21T12:00:00Z",
+          home: "2026-08-21T12:30:00Z",
+        },
+      })
+      .mockRejectedValueOnce(new Error("private snapshot failure"));
+    requestAreaContentUpdateMock.mockResolvedValueOnce({
+      areaId: "home",
+      contentType: "maintenance_tasks",
+      status: "updated",
+      revision: 3,
+    });
+
+    const user = await renderReview();
+    await user.click(screen.getByRole("button", { name: "Remove Make her Saturday coffee from Favorites" }));
+    await user.click(screen.getByRole("button", { name: "Refresh Home" }));
+    await waitFor(() => expect(fetchReviewAreaSnapshotMock).toHaveBeenCalledTimes(2));
+
+    await act(async () => rejectRemove(new Error("private delete failure")));
+    expect(
+      await screen.findByText("Could not save that Favorite change. Your previous Favorites were restored."),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("region", { name: "Home" }).querySelector('time[datetime="2026-08-21T12:30:00Z"]'),
+    ).toBeInTheDocument();
+  });
+
+  it("moves Favorite-card focus to the Favorites heading but leaves weekly-heart focus mounted", async () => {
+    const user = await renderThoughtfulReview();
+    const thoughtfulRegion = screen.getByRole("region", { name: "Thoughtful Suggestions" });
+    const favoritesHeading = within(thoughtfulRegion).getByRole("heading", { name: "Favorites" });
+    const favoriteHeart = within(thoughtfulRegion).getByRole("button", {
+      name: "Remove Make her Saturday coffee from Favorites",
+    });
+
+    favoriteHeart.focus();
+    await user.click(favoriteHeart);
+    expect(favoritesHeading).toHaveFocus();
+    expect(favoriteHeart).not.toBeInTheDocument();
+
+    // Add a weekly Favorite so its heart is pressed, then remove it from the
+    // weekly card. That button remains mounted, so focus should stay on it.
+    const weeklyHeart = within(thoughtfulRegion).getByRole("button", {
+      name: "Add Pack her favorite lunch to Favorites",
+    });
+    await user.click(weeklyHeart);
+    const pressedWeeklyHeart = within(thoughtfulRegion).getByRole("button", {
+      name: "Remove Pack her favorite lunch from Favorites",
+    });
+    pressedWeeklyHeart.focus();
+    await user.click(pressedWeeklyHeart);
+    expect(pressedWeeklyHeart).toHaveFocus();
+    expect(pressedWeeklyHeart).toHaveAttribute("aria-pressed", "false");
   });
 
   it("updates the open-area summary and moves focus to a sibling before removing a row", async () => {

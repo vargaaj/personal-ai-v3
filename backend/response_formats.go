@@ -17,9 +17,10 @@ import (
 // response contracts. Keeping them beside the response-format functions makes
 // it harder for a request to accidentally receive another area's JSON shape.
 const (
-	maintenanceTasksContentType          = "maintenance_tasks"
-	weeklyMealRecommendationsContentType = "weekly_meal_recommendations"
-	weeklyWorkoutRoutineContentType      = "weekly_workout_routine"
+	maintenanceTasksContentType            = "maintenance_tasks"
+	weeklyMealRecommendationsContentType   = "weekly_meal_recommendations"
+	weeklyWorkoutRoutineContentType        = "weekly_workout_routine"
+	weeklyThoughtfulSuggestionsContentType = "weekly_thoughtful_suggestions"
 )
 
 // responseFormatForContentType selects the JSON contract that matches the
@@ -34,9 +35,133 @@ func responseFormatForContentType(contentType string) (components.ResponseFormat
 		return weeklyMealRecommendationsResponseFormat(), true
 	case weeklyWorkoutRoutineContentType:
 		return weeklyWorkoutRoutineResponseFormat(), true
+	case weeklyThoughtfulSuggestionsContentType:
+		return weeklyThoughtfulSuggestionsResponseFormat(), true
 	default:
 		return components.ResponseFormat{}, false
 	}
+}
+
+// weeklyThoughtfulSuggestionsResponseFormat defines the complete Thoughtful
+// Suggestions document shown in the Review screen. The weekly Suggestions list
+// is replaceable content, while Favorites are deliberate saved records that
+// must return verbatim. The provider descriptions express those cross-array
+// rules because JSON Schema can describe each object shape but cannot compare a
+// generated suggestion with a saved favorite or verify an exact array copy.
+//
+// A refresh always creates the requested current Sunday-starting week and
+// supplies exactly five new ideas. Each favorite keeps its own ID and the ID of
+// the suggestion from which it was saved, so the stored record remains
+// traceable even after a later refresh replaces the weekly list.
+// Called by responseFormatForContentType in response_formats.go.
+func weeklyThoughtfulSuggestionsResponseFormat() components.ResponseFormat {
+	suggestionSchema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"id": map[string]any{
+				"type":        "string",
+				"minLength":   1,
+				"description": "New unique identifier for this current-week suggestion. It must not repeat an identifier from Favorites.",
+			},
+			"title": map[string]any{
+				"type":        "string",
+				"minLength":   1,
+				"description": "Concise, considerate action title shown in the weekly Suggestions list.",
+			},
+			"details": map[string]any{
+				"type":        "string",
+				"minLength":   1,
+				"description": "Practical, specific context that makes this suggestion easy to carry out.",
+			},
+			"category": map[string]any{
+				"type":        "string",
+				"minLength":   1,
+				"description": "Short grouping such as encouragement, practical help, quality time, or affection.",
+			},
+		},
+		"required":             []string{"id", "title", "details", "category"},
+		"additionalProperties": false,
+	}
+
+	favoriteSchema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"id": map[string]any{
+				"type":        "string",
+				"minLength":   1,
+				"description": "Stable identifier belonging to this saved favorite; copy it exactly from the input.",
+			},
+			"source_suggestion_id": map[string]any{
+				"type":        "string",
+				"minLength":   1,
+				"description": "Identifier of the original suggestion that was saved; copy it exactly from the input.",
+			},
+			"title": map[string]any{
+				"type":        "string",
+				"minLength":   1,
+				"description": "Saved suggestion title; copy it exactly from the input.",
+			},
+			"details": map[string]any{
+				"type":        "string",
+				"minLength":   1,
+				"description": "Saved suggestion details; copy them exactly from the input.",
+			},
+			"category": map[string]any{
+				"type":        "string",
+				"minLength":   1,
+				"description": "Saved suggestion category; copy it exactly from the input.",
+			},
+			"saved_at": map[string]any{
+				"type":        "string",
+				"pattern":     `^\d{4}-\d{2}-\d{2}$`,
+				"description": "Date this favorite was saved, formatted as YYYY-MM-DD; copy it exactly from the input.",
+			},
+		},
+		"required": []string{
+			"id",
+			"source_suggestion_id",
+			"title",
+			"details",
+			"category",
+			"saved_at",
+		},
+		"additionalProperties": false,
+	}
+
+	responseFormat := components.CreateResponseFormatJSONSchema(
+		components.ChatFormatJSONSchemaConfig{
+			JSONSchema: components.ChatJSONSchemaConfig{
+				Name: weeklyThoughtfulSuggestionsContentType,
+				Schema: map[string]any{
+					"type":        "object",
+					"description": "Return the complete Thoughtful Suggestions document for the requested current week. Set week_starting to the requested Sunday. Create exactly five new suggestions, and do not repeat any saved favorite in Suggestions. Copy every favorite exactly and in the same order from the input Favorites array.",
+					"properties": map[string]any{
+						"week_starting": map[string]any{
+							"type":        "string",
+							"pattern":     `^\d{4}-\d{2}-\d{2}$`,
+							"description": "Sunday that starts the requested current week, formatted as YYYY-MM-DD.",
+						},
+						"suggestions": map[string]any{
+							"type":        "array",
+							"minItems":    5,
+							"maxItems":    5,
+							"description": "Exactly five new current-week suggestions. Do not repeat a saved favorite in this array.",
+							"items":       suggestionSchema,
+						},
+						"favorites": map[string]any{
+							"type":        "array",
+							"description": "All saved favorites copied exactly and in input order, including when the array is empty.",
+							"items":       favoriteSchema,
+						},
+					},
+					"required":             []string{"week_starting", "suggestions", "favorites"},
+					"additionalProperties": false,
+				},
+				Strict: optionalnullable.From(openrouter.Pointer(true)),
+			},
+		},
+	)
+	return responseFormat
 }
 
 // maintenanceTasksResponseFormat defines the Home document returned after its

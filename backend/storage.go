@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -71,6 +73,30 @@ var errAreaEntryStateNotFound = errors.New("area entry was not found")
 // document after this operation read it. The caller must reload before retrying
 // so an entry-state click can never overwrite a newly generated weekly plan.
 var errAreaEntryStateRevisionConflict = errors.New("area entry state revision conflict")
+
+// errThoughtfulFavoriteNotConfigured protects the favorite mutation boundary
+// from arbitrary area/content pairs. Only the one Thoughtful Suggestions
+// document may be changed by the add and remove operations below.
+var errThoughtfulFavoriteNotConfigured = errors.New("thoughtful favorites are not configured")
+
+// errThoughtfulSuggestionNotFound means the requested weekly source is not in
+// the currently stored document. A browser can reach this state after a weekly
+// refresh replaces the suggestion it was displaying.
+var errThoughtfulSuggestionNotFound = errors.New("thoughtful suggestion was not found")
+
+// errThoughtfulFavoriteNotFound identifies a remove request whose durable
+// favorite ID is no longer present, such as a repeated click from a stale tab.
+var errThoughtfulFavoriteNotFound = errors.New("thoughtful favorite was not found")
+
+// errThoughtfulFavoriteAlreadyExists prevents duplicate durable Favorite IDs and
+// duplicate source-suggestion references. Repeated add or Undo requests return
+// this known state instead of creating ambiguous cards in the Favorites section.
+var errThoughtfulFavoriteAlreadyExists = errors.New("thoughtful favorite already exists")
+
+// errThoughtfulFavoriteRevisionConflict means the browser or another writer
+// changed the document revision before this mutation could save. The HTTP layer
+// will translate it to a conflict response so React can reload the latest area.
+var errThoughtfulFavoriteRevisionConflict = errors.New("thoughtful favorite revision conflict")
 
 // openDatabase creates a small database/sql connection pool for Supabase. The
 // supplied URL should be the Session Pooler connection string copied from the
@@ -388,6 +414,522 @@ type AreaEntryState struct {
 	EntryID     string `json:"entry_id"`
 	State       string `json:"state"`
 	Revision    int    `json:"revision"`
+}
+
+// ThoughtfulFavoriteMutation is the compact storage result shared by add,
+// remove, and restore operations. Remove returns the complete deleted Favorite
+// so a later HTTP/UI increment can offer Undo without relying on a stale
+// display-only copy. Revision identifies the document version produced by the
+// conditional save.
+type ThoughtfulFavoriteMutation struct {
+	AreaID      string             `json:"area_id"`
+	ContentType string             `json:"content_type"`
+	Favorite    thoughtfulFavorite `json:"favorite"`
+	Revision    int                `json:"revision"`
+}
+
+// addThoughtfulFavorite copies one server-side weekly suggestion into the
+// durable Favorites array. The browser supplies only identity and the revision
+// it rendered; title, details, and category always come from stored content so
+// a request cannot save text that was never displayed as a suggestion.
+//
+// The favorite is prepended because the interface presents most-recently-added
+// items first. This small mutation increments revision but deliberately preserves
+// updated_at, which continues to mean "when weekly suggestions were generated."
+func addThoughtfulFavorite(
+	ctx context.Context,
+	db *sql.DB,
+	areaID string,
+	contentType string,
+	sourceSuggestionID string,
+	expectedRevision int,
+	savedAt time.Time,
+) (ThoughtfulFavoriteMutation, error) {
+	if db == nil {
+		return ThoughtfulFavoriteMutation{}, errors.New("database is required")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	areaID = strings.TrimSpace(areaID)
+	contentType = strings.TrimSpace(contentType)
+	if !supportsThoughtfulFavoritesDocument(areaID, contentType) {
+		return ThoughtfulFavoriteMutation{}, fmt.Errorf(
+			"%w for %s/%s",
+			errThoughtfulFavoriteNotConfigured,
+			areaID,
+			contentType,
+		)
+	}
+	if err := validateThoughtfulMutationID("source suggestion id", sourceSuggestionID); err != nil {
+		return ThoughtfulFavoriteMutation{}, err
+	}
+	if expectedRevision < 1 {
+		return ThoughtfulFavoriteMutation{}, errors.New("expected revision must be positive")
+	}
+	if savedAt.IsZero() {
+		return ThoughtfulFavoriteMutation{}, errors.New("favorite saved time is required")
+	}
+
+	current, err := loadThoughtfulFavoriteContent(ctx, db, areaID, contentType)
+	if err != nil {
+		return ThoughtfulFavoriteMutation{}, err
+	}
+	if current.Revision != expectedRevision {
+		return ThoughtfulFavoriteMutation{}, fmt.Errorf(
+			"%w for %s/%s: expected revision %d, found %d",
+			errThoughtfulFavoriteRevisionConflict,
+			current.AreaID,
+			current.ContentType,
+			expectedRevision,
+			current.Revision,
+		)
+	}
+
+	document, err := decodeStoredThoughtfulSuggestions(current)
+	if err != nil {
+		return ThoughtfulFavoriteMutation{}, err
+	}
+
+	var source weeklyThoughtfulIdea
+	sourceFound := false
+	for _, suggestion := range document.Suggestions {
+		if suggestion.ID != sourceSuggestionID {
+			continue
+		}
+		source = suggestion
+		sourceFound = true
+		break
+	}
+	if !sourceFound {
+		return ThoughtfulFavoriteMutation{}, fmt.Errorf(
+			"%w for %s/%s suggestion %q",
+			errThoughtfulSuggestionNotFound,
+			current.AreaID,
+			current.ContentType,
+			sourceSuggestionID,
+		)
+	}
+	for _, favorite := range document.Favorites {
+		if favorite.SourceSuggestionID == sourceSuggestionID {
+			return ThoughtfulFavoriteMutation{}, fmt.Errorf(
+				"%w for %s/%s suggestion %q",
+				errThoughtfulFavoriteAlreadyExists,
+				current.AreaID,
+				current.ContentType,
+				sourceSuggestionID,
+			)
+		}
+	}
+
+	favoriteID, err := newThoughtfulFavoriteID()
+	if err != nil {
+		return ThoughtfulFavoriteMutation{}, err
+	}
+	favorite := thoughtfulFavorite{
+		ID:                 favoriteID,
+		SourceSuggestionID: source.ID,
+		Title:              source.Title,
+		Details:            source.Details,
+		Category:           source.Category,
+		SavedAt:            savedAt.Format("2006-01-02"),
+	}
+
+	// Build a new slice instead of reusing the existing backing array. That keeps
+	// the decoded snapshot unchanged while the save is still subject to the SQL
+	// revision predicate below.
+	document.Favorites = append(
+		[]thoughtfulFavorite{favorite},
+		document.Favorites...,
+	)
+	updatedJSON, err := json.Marshal(document)
+	if err != nil {
+		return ThoughtfulFavoriteMutation{}, fmt.Errorf("encode thoughtful favorite document: %w", err)
+	}
+
+	saved, err := saveThoughtfulFavoriteDocument(ctx, db, current, updatedJSON)
+	if err != nil {
+		return ThoughtfulFavoriteMutation{}, err
+	}
+	return ThoughtfulFavoriteMutation{
+		AreaID:      saved.AreaID,
+		ContentType: saved.ContentType,
+		Favorite:    favorite,
+		Revision:    saved.Revision,
+	}, nil
+}
+
+// removeThoughtfulFavorite deletes one durable Favorite by its own ID rather
+// than by the weekly source ID. The source suggestion may already be gone after
+// a refresh, while the durable Favorite remains independently addressable.
+// Returning the removed record preserves everything a later Undo request needs.
+func removeThoughtfulFavorite(
+	ctx context.Context,
+	db *sql.DB,
+	areaID string,
+	contentType string,
+	favoriteID string,
+	expectedRevision int,
+) (ThoughtfulFavoriteMutation, error) {
+	if db == nil {
+		return ThoughtfulFavoriteMutation{}, errors.New("database is required")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	areaID = strings.TrimSpace(areaID)
+	contentType = strings.TrimSpace(contentType)
+	if !supportsThoughtfulFavoritesDocument(areaID, contentType) {
+		return ThoughtfulFavoriteMutation{}, fmt.Errorf(
+			"%w for %s/%s",
+			errThoughtfulFavoriteNotConfigured,
+			areaID,
+			contentType,
+		)
+	}
+	if err := validateThoughtfulMutationID("favorite id", favoriteID); err != nil {
+		return ThoughtfulFavoriteMutation{}, err
+	}
+	if expectedRevision < 1 {
+		return ThoughtfulFavoriteMutation{}, errors.New("expected revision must be positive")
+	}
+
+	current, err := loadThoughtfulFavoriteContent(ctx, db, areaID, contentType)
+	if err != nil {
+		return ThoughtfulFavoriteMutation{}, err
+	}
+	if current.Revision != expectedRevision {
+		return ThoughtfulFavoriteMutation{}, fmt.Errorf(
+			"%w for %s/%s: expected revision %d, found %d",
+			errThoughtfulFavoriteRevisionConflict,
+			current.AreaID,
+			current.ContentType,
+			expectedRevision,
+			current.Revision,
+		)
+	}
+
+	document, err := decodeStoredThoughtfulSuggestions(current)
+	if err != nil {
+		return ThoughtfulFavoriteMutation{}, err
+	}
+
+	removedIndex := -1
+	var removed thoughtfulFavorite
+	for index, favorite := range document.Favorites {
+		if favorite.ID != favoriteID {
+			continue
+		}
+		removedIndex = index
+		removed = favorite
+		break
+	}
+	if removedIndex < 0 {
+		return ThoughtfulFavoriteMutation{}, fmt.Errorf(
+			"%w for %s/%s favorite %q",
+			errThoughtfulFavoriteNotFound,
+			current.AreaID,
+			current.ContentType,
+			favoriteID,
+		)
+	}
+
+	// Copy both sides into a fresh slice so removing one Favorite cannot mutate
+	// the decoded snapshot through a shared backing array before the SQL save wins.
+	remainingFavorites := make([]thoughtfulFavorite, 0, len(document.Favorites)-1)
+	remainingFavorites = append(remainingFavorites, document.Favorites[:removedIndex]...)
+	remainingFavorites = append(remainingFavorites, document.Favorites[removedIndex+1:]...)
+	document.Favorites = remainingFavorites
+	updatedJSON, err := json.Marshal(document)
+	if err != nil {
+		return ThoughtfulFavoriteMutation{}, fmt.Errorf("encode thoughtful favorite document: %w", err)
+	}
+
+	saved, err := saveThoughtfulFavoriteDocument(ctx, db, current, updatedJSON)
+	if err != nil {
+		return ThoughtfulFavoriteMutation{}, err
+	}
+	return ThoughtfulFavoriteMutation{
+		AreaID:      saved.AreaID,
+		ContentType: saved.ContentType,
+		Favorite:    removed,
+		Revision:    saved.Revision,
+	}, nil
+}
+
+// restoreThoughtfulFavorite reinstates the complete durable record returned by
+// removeThoughtfulFavorite. Unlike addThoughtfulFavorite, it never reads the
+// current Suggestions array for a source: that weekly source can legitimately
+// have expired during the eight-second Undo window. The supplied Favorite is
+// validated and stored field-for-field, including its original durable ID and
+// saved_at date.
+//
+// A removed record's former array index is not part of the durable Favorite, so
+// restore deterministically prepends it. This matches add's newest-interaction-
+// first list behavior and makes a successful Undo immediately visible while
+// preserving every field that represents the original saved record.
+func restoreThoughtfulFavorite(
+	ctx context.Context,
+	db *sql.DB,
+	areaID string,
+	contentType string,
+	favorite thoughtfulFavorite,
+	expectedRevision int,
+) (ThoughtfulFavoriteMutation, error) {
+	if db == nil {
+		return ThoughtfulFavoriteMutation{}, errors.New("database is required")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	areaID = strings.TrimSpace(areaID)
+	contentType = strings.TrimSpace(contentType)
+	if !supportsThoughtfulFavoritesDocument(areaID, contentType) {
+		return ThoughtfulFavoriteMutation{}, fmt.Errorf(
+			"%w for %s/%s",
+			errThoughtfulFavoriteNotConfigured,
+			areaID,
+			contentType,
+		)
+	}
+	if err := validateThoughtfulFavoriteRestore(favorite); err != nil {
+		return ThoughtfulFavoriteMutation{}, err
+	}
+	if expectedRevision < 1 {
+		return ThoughtfulFavoriteMutation{}, errors.New("expected revision must be positive")
+	}
+
+	current, err := loadThoughtfulFavoriteContent(ctx, db, areaID, contentType)
+	if err != nil {
+		return ThoughtfulFavoriteMutation{}, err
+	}
+	if current.Revision != expectedRevision {
+		return ThoughtfulFavoriteMutation{}, fmt.Errorf(
+			"%w for %s/%s: expected revision %d, found %d",
+			errThoughtfulFavoriteRevisionConflict,
+			current.AreaID,
+			current.ContentType,
+			expectedRevision,
+			current.Revision,
+		)
+	}
+
+	document, err := decodeStoredThoughtfulSuggestions(current)
+	if err != nil {
+		return ThoughtfulFavoriteMutation{}, err
+	}
+
+	// A Favorite ID shares the document-wide identity namespace with current
+	// suggestions. Checking both arrays before save keeps Undo from introducing
+	// duplicate React keys or an invalid stored Thoughtful document.
+	for _, suggestion := range document.Suggestions {
+		if suggestion.ID == favorite.ID {
+			return ThoughtfulFavoriteMutation{}, fmt.Errorf(
+				"%w for %s/%s id %q",
+				errThoughtfulFavoriteAlreadyExists,
+				current.AreaID,
+				current.ContentType,
+				favorite.ID,
+			)
+		}
+	}
+	for _, existingFavorite := range document.Favorites {
+		if existingFavorite.ID == favorite.ID {
+			return ThoughtfulFavoriteMutation{}, fmt.Errorf(
+				"%w for %s/%s favorite %q",
+				errThoughtfulFavoriteAlreadyExists,
+				current.AreaID,
+				current.ContentType,
+				favorite.ID,
+			)
+		}
+		if existingFavorite.SourceSuggestionID == favorite.SourceSuggestionID {
+			return ThoughtfulFavoriteMutation{}, fmt.Errorf(
+				"%w for %s/%s source suggestion %q",
+				errThoughtfulFavoriteAlreadyExists,
+				current.AreaID,
+				current.ContentType,
+				favorite.SourceSuggestionID,
+			)
+		}
+	}
+
+	// Use a new backing array so the decoded document remains unchanged until the
+	// conditional UPDATE below wins. favorite is inserted as the exact value the
+	// caller supplied; no weekly-source lookup or field reconstruction occurs.
+	document.Favorites = append(
+		[]thoughtfulFavorite{favorite},
+		document.Favorites...,
+	)
+	updatedJSON, err := json.Marshal(document)
+	if err != nil {
+		return ThoughtfulFavoriteMutation{}, fmt.Errorf("encode thoughtful favorite document: %w", err)
+	}
+
+	saved, err := saveThoughtfulFavoriteDocument(ctx, db, current, updatedJSON)
+	if err != nil {
+		return ThoughtfulFavoriteMutation{}, err
+	}
+	return ThoughtfulFavoriteMutation{
+		AreaID:      saved.AreaID,
+		ContentType: saved.ContentType,
+		Favorite:    favorite,
+		Revision:    saved.Revision,
+	}, nil
+}
+
+// supportsThoughtfulFavoritesDocument is an explicit mutation allowlist. A
+// future area with similarly named JSON arrays receives no write access until
+// its own product and concurrency rules are intentionally implemented.
+func supportsThoughtfulFavoritesDocument(areaID string, contentType string) bool {
+	return areaID == "thoughtful" && contentType == weeklyThoughtfulSuggestionsContentType
+}
+
+// validateThoughtfulMutationID retains literal identity at the storage edge.
+// Trimming would make a malformed request silently address a different record.
+func validateThoughtfulMutationID(fieldName string, value string) error {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return fmt.Errorf("%s is required", fieldName)
+	}
+	if value != trimmed {
+		return fmt.Errorf("%s must not have leading or trailing whitespace", fieldName)
+	}
+	return nil
+}
+
+// validateThoughtfulFavoriteRestore requires the complete durable record that
+// removeThoughtfulFavorite returned. It intentionally validates only the
+// record's own shape, not whether SourceSuggestionID remains in the replaceable
+// current-week Suggestions array.
+func validateThoughtfulFavoriteRestore(favorite thoughtfulFavorite) error {
+	const favoriteName = "restored thoughtful favorite"
+
+	if err := validateThoughtfulIdeaFields(
+		favoriteName,
+		favorite.ID,
+		favorite.Title,
+		favorite.Details,
+		favorite.Category,
+	); err != nil {
+		return err
+	}
+	if err := validateThoughtfulFavoriteSourceID(favoriteName, favorite.SourceSuggestionID); err != nil {
+		return err
+	}
+	if _, err := time.Parse("2006-01-02", favorite.SavedAt); err != nil {
+		return fmt.Errorf("%s saved_at must be a YYYY-MM-DD date: %w", favoriteName, err)
+	}
+	return nil
+}
+
+// loadThoughtfulFavoriteContent converts a missing database row into the known
+// configuration sentinel used by the future HTTP layer. Other storage failures
+// retain their wrapped cause for server logs and diagnostic tests.
+func loadThoughtfulFavoriteContent(
+	ctx context.Context,
+	db *sql.DB,
+	areaID string,
+	contentType string,
+) (AreaContent, error) {
+	current, err := loadAreaContent(ctx, db, areaID, contentType)
+	if errors.Is(err, sql.ErrNoRows) {
+		return AreaContent{}, fmt.Errorf(
+			"%w for %s/%s",
+			errThoughtfulFavoriteNotConfigured,
+			areaID,
+			contentType,
+		)
+	}
+	if err != nil {
+		return AreaContent{}, fmt.Errorf("load thoughtful favorite content: %w", err)
+	}
+	return current, nil
+}
+
+// decodeStoredThoughtfulSuggestions applies the same strict document contract
+// used by model-output validation before any favorite mutation is constructed.
+// Passing no expected week accepts a legitimately older stored Sunday while
+// still requiring five suggestions, valid Favorites, and unique identities.
+func decodeStoredThoughtfulSuggestions(
+	current AreaContent,
+) (weeklyThoughtfulSuggestionsDocument, error) {
+	var document weeklyThoughtfulSuggestionsDocument
+	if err := decodeStrictJSONDocument(
+		"stored weekly thoughtful suggestions",
+		string(current.Content),
+		&document,
+	); err != nil {
+		return weeklyThoughtfulSuggestionsDocument{}, err
+	}
+	if err := validateWeeklyThoughtfulSuggestionsDocument(
+		"stored weekly thoughtful suggestions",
+		document,
+		"",
+	); err != nil {
+		return weeklyThoughtfulSuggestionsDocument{}, err
+	}
+	return document, nil
+}
+
+// saveThoughtfulFavoriteDocument performs the final atomic revision check for
+// add, remove, and restore. updated_at is intentionally absent from SET so
+// favorite interactions never postpone the scheduled weekly content refresh.
+func saveThoughtfulFavoriteDocument(
+	ctx context.Context,
+	db *sql.DB,
+	current AreaContent,
+	updatedJSON []byte,
+) (AreaContent, error) {
+	row := db.QueryRowContext(ctx, `
+		UPDATE personal_ai.area_content
+		SET content = $3::jsonb,
+			revision = revision + 1
+		WHERE area_id = $1
+			AND content_type = $2
+			AND revision = $4
+		RETURNING area_id, content_type, content::text, revision, updated_at
+	`, current.AreaID, current.ContentType, string(updatedJSON), current.Revision)
+
+	saved, err := scanAreaContentRow(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return AreaContent{}, fmt.Errorf(
+			"%w for %s/%s",
+			errThoughtfulFavoriteRevisionConflict,
+			current.AreaID,
+			current.ContentType,
+		)
+	}
+	if err != nil {
+		return AreaContent{}, fmt.Errorf("save thoughtful favorite content: %w", err)
+	}
+	return saved, nil
+}
+
+// newThoughtfulFavoriteID creates a random durable identifier that is distinct
+// from the source suggestion ID. RFC 4122 version and variant bits make the
+// value recognizable as a UUID while the prefix identifies its product role in
+// logs and database JSON without exposing suggestion text.
+func newThoughtfulFavoriteID() (string, error) {
+	randomBytes := make([]byte, 16)
+	if _, err := rand.Read(randomBytes); err != nil {
+		return "", fmt.Errorf("generate thoughtful favorite id: %w", err)
+	}
+	randomBytes[6] = (randomBytes[6] & 0x0f) | 0x40
+	randomBytes[8] = (randomBytes[8] & 0x3f) | 0x80
+
+	encoded := hex.EncodeToString(randomBytes)
+	return fmt.Sprintf(
+		"favorite-%s-%s-%s-%s-%s",
+		encoded[0:8],
+		encoded[8:12],
+		encoded[12:16],
+		encoded[16:20],
+		encoded[20:32],
+	), nil
 }
 
 // saveAreaEntryState performs the revision-safe read-modify-write operation for
