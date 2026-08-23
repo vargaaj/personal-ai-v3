@@ -1,10 +1,10 @@
 # Personal AI
 
-A private review console for gathering the small decisions and recurring work
-spread across everyday life. The current Review screen turns independently
-stored Home, Health, and Meals documents into one responsive, accessible queue.
-Reading is a retired legacy area: stored Reading rows are ignored and are not
-part of the visible product.
+A private review console for gathering the small decisions, recurring work, and
+small acts of care spread across everyday life. The current Review screen turns
+independently stored Home, Health, Meals, and Thoughtful Suggestions documents
+into one responsive, accessible queue. Reading is a retired legacy area: stored
+Reading rows are ignored and are not part of the visible product.
 
 The application now runs as one connected system:
 
@@ -17,12 +17,19 @@ React + Vite  --->  Go JSON API  --->  Supabase Postgres
 The browser loads saved area content from Go. Go reads and writes JSON documents
 in Supabase. Home, Health, and Meals can each be regenerated through OpenRouter
 manually from the Review screen or automatically through the weekly scheduler.
+Thoughtful Suggestions is loaded from its stored weekly document; its Favorites
+are saved independently through revision-safe heart actions.
 
 ## What works today
 
-- Load the visible database-backed Home, Health, and Meals areas.
+- Load the visible database-backed Home, Health, Meals, and Thoughtful Suggestions
+  areas.
 - Review every area together or focus on one area.
-- Filter entries by Open, All, or Done and search their visible content.
+- Filter task entries by Open, All, or Done and search their visible content.
+- Browse exactly five current-week Thoughtful Suggestions without treating them
+  as tasks, then save or remove durable Favorites with heart controls.
+- Search Thoughtful Suggestions and Favorites by title, details, category, or
+  saved date.
 - Persist Home and Health entry state changes through the revision-safe API;
   Meals entry state remains browser-session-only.
 - Regenerate Home, Health, Meals, or all three from the interface.
@@ -50,6 +57,7 @@ manually from the Review screen or automatically through the weekly scheduler.
     |-- updater.go                  Refresh orchestration, locking, and persistence
     |-- area_content_validation.go  Per-content local semantic validation
     |-- area_entry_state_http.go    Home/Health entry-state PUT route
+    |-- area_favorite_http.go       Thoughtful Suggestions Favorite routes
     |-- area_prompt_http.go         Area-update prompt HTTP routes
     |-- response_formats.go         Per-content OpenRouter response schemas
     `-- chat.go                     OpenRouter request boundary
@@ -80,13 +88,16 @@ The frontend currently recognizes these rows from
 | Home | `maintenance_tasks` | `entries` | Manual or scheduled |
 | Health | `weekly_workout_routine` | `entries` | Manual or scheduled |
 | Meals | `weekly_meal_recommendations` | `recommendations` | Manual or scheduled |
+| Thoughtful Suggestions | `weekly_thoughtful_suggestions` | `suggestions`, `favorites` | Display and Favorite mutations |
 
 Display names, descriptions, colors, and ordering remain frontend-owned.
 Reading is intentionally absent from the table because it is retired; matching
 legacy rows are ignored. Other unknown database documents are ignored until a
 matching frontend definition is added. Update instructions for the three
-refreshable documents come from
-`personal_ai.area_update_prompt`.
+refreshable documents come from `personal_ai.area_update_prompt`. Thoughtful
+Suggestions is not currently registered as a manual or scheduled refresh target;
+its stored document is displayed as-is while Favorite mutations update only its
+durable `favorites` collection.
 
 ## Local development
 
@@ -147,6 +158,8 @@ processes need to be running for the Review screen to load.
 | --- | --- | --- |
 | `GET` | `/api/areas` | Return every stored area document |
 | `PUT` | `/api/areas/{areaID}/{contentType}/entries/{entryID}/state` | Persist one Home or Health entry's `open`/`done` state with revision safety |
+| `PUT` | `/api/areas/{areaID}/{contentType}/suggestions/{sourceID}/favorite` | Copy one stored Thoughtful suggestion into durable Favorites with revision safety |
+| `DELETE` | `/api/areas/{areaID}/{contentType}/favorites/{favoriteID}` | Remove one durable Thoughtful Favorite with revision safety |
 | `GET` | `/api/areas/{areaID}/{contentType}/prompt` | Return one enabled refresh prompt |
 | `PUT` | `/api/areas/{areaID}/{contentType}/prompt` | Create or replace a refresh prompt without regenerating content |
 | `POST` | `/api/areas/weekly-update` | Force-refresh Home, Health, and Meals |
@@ -171,6 +184,17 @@ current document revision and saves only when that revision still matches, so a
 concurrent refresh cannot be overwritten by an older browser action. Meals
 recommendations have no persisted entry ids and remain session-only in the
 browser.
+
+Thoughtful Suggestions uses the same revision-safe document boundary for its
+heart actions. A Favorite PUT accepts only the current suggestion ID and
+expected revision; the server copies the title, details, and category from the
+stored document and assigns the saved date. DELETE uses the server-generated
+Favorite ID, so a saved idea remains removable even after a later week replaces
+its source suggestion. The frontend updates the heart and Favorites list
+optimistically, then reconciles the latest snapshot if a concurrent writer
+causes a conflict. Generated Thoughtful documents must contain exactly five new
+suggestions and preserve the complete Favorites array field-for-field and in
+order.
 
 Prompt GET and PUT requests can be canceled when the editor closes, a newer
 request starts, or the page unmounts. The Edit Prompt control is disabled during
@@ -318,11 +342,13 @@ Manual and scheduled refreshes send the selected document and its stored prompt
 to OpenRouter. Home, Health, and Meals are non-ZDR targets, so do not store data
 in those documents that you are not comfortable sharing with the configured
 provider. Each content type has its own response schema: Home uses a maintenance
-task document, Health uses a workout document, and Meals uses a recommendation
-document. After decoding, the backend performs local semantic validation for
-that content type before saving; there is no universal same-shape rule. The
+task document, Health uses a workout document, Meals uses a recommendation
+document, and Thoughtful Suggestions uses five ideas plus a durable Favorites
+array. After decoding, the backend performs local semantic validation for that
+content type before saving; there is no universal same-shape rule. The
 validators still enforce the preservation rules that matter for each document,
-including keeping unfinished Home tasks unchanged.
+including keeping unfinished Home tasks unchanged and preserving Thoughtful
+Favorites exactly.
 
 `.env.local` files are ignored by Git. Keep database credentials, API keys, and
 other machine-specific secrets out of committed files.
@@ -332,7 +358,8 @@ other machine-specific secrets out of committed files.
 - Meals entry state changes are browser-session-only and reset on reload; Home
   and Health state changes are persisted by the entry-state endpoint.
 - Reading is retired and ignored; Home, Health, and Meals are the model-driven
-  update targets.
+  update targets. Thoughtful Suggestions is displayable and its Favorites are
+  mutable, but the weekly updater does not refresh it yet.
 - Database migrations and seed data are intentionally deferred; deployment
   currently requires the existing configured Supabase database.
 - Cloud Run and Scheduler resources are configured in the Google Cloud Console;
